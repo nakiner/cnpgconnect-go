@@ -1,0 +1,27 @@
+.PHONY: test race vet fmt check-fmt examples integration-compile check
+
+test:
+	go test ./...
+
+race:
+	go test -race ./...
+
+vet:
+	go vet ./...
+	cd examples/bun && go vet ./...
+
+fmt:
+	gofmt -w .
+
+check-fmt:
+	@test -z "$$(gofmt -l .)" || \
+		(echo 'Run make fmt to format Go files'; exit 1)
+
+examples:
+	go test ./examples/...
+	cd examples/bun && go test ./...
+
+integration-compile:
+	go test -tags=integration -run '^$$' ./test/integration
+
+check: check-fmt race vet examples integration-compile
