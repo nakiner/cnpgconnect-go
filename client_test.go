@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -89,6 +90,77 @@ func TestStreamReconnectAndClose(t *testing.T) {
 	wg.Wait()
 	if _, err := client.Resolve(context.Background(), Policy{}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("resolve closed: %v", err)
+	}
+}
+
+func TestRapidTopologyUpdatesDoNotWaitForSubscribers(t *testing.T) {
+	start := make(chan struct{})
+	var calls atomic.Int32
+	const updates = 64
+	address := startServer(t, func(stream grpc.ServerStreamingServer[connectv1.Snapshot]) error {
+		calls.Add(1)
+		if err := stream.Send(transitionSnapshot(time.Now(), Primary)); err != nil {
+			return err
+		}
+		select {
+		case <-start:
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+		for i := 1; i <= updates; i++ {
+			role := Primary
+			if i%2 == 0 {
+				role = SyncReplica
+			}
+			snapshot := transitionSnapshot(time.Now(), role)
+			snapshot.Revision = strconv.Itoa(i)
+			if i%3 == 0 {
+				snapshot.Available = false
+				snapshot.Reason = "primary_transition"
+			}
+			if err := stream.Send(snapshot); err != nil {
+				return err
+			}
+		}
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	})
+	cfg := localConfig(address)
+	// A stream reconnect would exceed the deadline below. Updates on an open
+	// stream must not inherit transport backoff or wait for adapter callbacks.
+	cfg.ReconnectMin, cfg.ReconnectMax = 5*time.Second, 5*time.Second
+	client, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oldPrimary, err := client.Resolve(context.Background(), Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Leave the subscription's initial notification unread to simulate a busy
+	// pool adapter while promotions and temporary unavailable states arrive.
+	_, unsubscribe := client.Subscribe()
+	defer unsubscribe()
+	close(start)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for client.Status().Revision != strconv.Itoa(updates) {
+		select {
+		case <-ctx.Done():
+			t.Fatal("busy subscriber delayed the latest topology")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	current, err := client.Resolve(ctx, Policy{})
+	if err != nil || current.MemberID != "other" {
+		t.Fatalf("latest primary = %+v, %v; want other", current, err)
+	}
+	if client.Valid(Policy{}, oldPrimary) {
+		t.Fatal("superseded primary connection remains eligible")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("role changes restarted the discovery stream %d times", got-1)
 	}
 }
 

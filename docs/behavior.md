@@ -13,7 +13,9 @@ Applications keep calling the same pgx pool or SQL DB throughout that process.
    fails; it does not change member or routing role to choose a reachable path.
 3. Every acquisition checks whether the connection still matches the current,
    unexpired routing policy. An obsolete connection is retired before use.
-4. Role changes and expiry wake pool maintenance. Borrowed connections retire
+4. Role changes and expiry wake pool maintenance. Connection attempts to an
+   obsolete member are canceled during startup, freeing their pool slots
+   without waiting for the connection timeout. Borrowed connections retire
    when released if their identity is no longer eligible.
 5. If the discovery stream closes, the client reconnects with bounded backoff.
    The last snapshot remains usable only until its validity deadline.
@@ -40,6 +42,10 @@ stop. It cannot eliminate the interval between a PostgreSQL role change and the
 plugin observing that change. Connection failures and PostgreSQL errors can
 still reach callers during this interval. The next acquisition uses current
 discovery information automatically.
+
+An acquisition already connecting to a superseded member can return a
+cancellation error. Subsequent acquisitions resolve the current topology;
+established transactions are unaffected by startup cancellation.
 
 Role labels reflect the primary's observed replication state. A synchronous
 standby does not by itself guarantee read-after-write visibility for every

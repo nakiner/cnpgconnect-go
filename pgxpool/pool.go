@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/multitracer"
 	"github.com/jackc/pgx/v5/pgconn"
 	native "github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nakiner/cnpgconnect-go"
@@ -63,6 +64,7 @@ type Pool struct {
 	close               sync.Once
 	mu                  sync.RWMutex
 	targets             map[*pgconn.PgConn]cnpgconnectgo.Target
+	connecting          map[*connectionAttempt]struct{}
 	automaticConnection bool
 }
 
@@ -200,6 +202,7 @@ func (p *Pool) watch(updates <-chan struct{}) {
 			if !ok {
 				return
 			}
+			p.cancelObsoleteConnections()
 			// AcquireAllIdle never waits for borrowed connections. Release routes
 			// each idle connection through our eligibility check, preserving the
 			// healthy subset and retiring obsolete connections in the background.
@@ -244,6 +247,16 @@ func (p *Pool) installHooks(cfg *native.Config) {
 			setEndpoint(cc, target.Endpoint)
 			appendEndpointFallback(cc, target.FallbackEndpoint)
 		}
+		// pgx's connection tracer supplies the context for the entire startup,
+		// including TLS/authentication between DialFunc and ValidateConnect.
+		// Keep application tracing while allowing obsolete attempts to stop as
+		// soon as discovery changes, freeing their pool slots for the new route.
+		tracer := &multitracer.Tracer{}
+		if cc.Tracer != nil {
+			tracer = multitracer.New(cc.Tracer)
+		}
+		tracer.ConnectTracers = append(tracer.ConnectTracers, connectionTracer{pool: p, target: target})
+		cc.Tracer = tracer
 		// pgx's background minimum-pool constructors are not canceled by pool
 		// shutdown. Bound DNS/dial and connect hooks as well as the native
 		// network startup timeout, and tie cooperative callbacks to our lifetime.
@@ -321,6 +334,17 @@ func (p *Pool) installHooks(cfg *native.Config) {
 			return errors.New("cnpgconnect-go/pgxpool: topology changed while connecting")
 		}
 		if afterConnect != nil {
+			// Native pgxpool invokes this hook after pgx's ConnectEnd. Keep
+			// cooperative session initialization cancellable until the pool
+			// constructor finishes, without extending it into borrowed sessions.
+			p.mu.RLock()
+			target, ok := p.targets[conn.PgConn()]
+			p.mu.RUnlock()
+			if !ok {
+				return errors.New("cnpgconnect-go/pgxpool: connection closed while preparing")
+			}
+			ctx, attempt := p.beginConnectionAttempt(ctx, target)
+			defer p.endConnectionAttempt(attempt)
 			if err := afterConnect(ctx, conn); err != nil {
 				return err
 			}
