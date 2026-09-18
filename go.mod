@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/nakiner/cnpg-connect-plugin v0.0.3
+	github.com/nakiner/cnpg-connect-plugin v0.0.4
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )
