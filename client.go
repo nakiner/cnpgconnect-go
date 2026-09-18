@@ -157,27 +157,16 @@ func (c *Client) waitReady(ctx context.Context) error {
 
 func (c *Client) run() {
 	defer close(c.done)
-	// Expiry must notify idle pools even when a stream stays open but stalls.
 	var expiry sync.WaitGroup
 	expiry.Add(1)
 	go func() {
 		defer expiry.Done()
-		ticker := time.NewTicker(min(100*time.Millisecond, c.cfg.MaxSnapshotTTL/4))
-		defer ticker.Stop()
-		for {
-			select {
-			case now := <-ticker.C:
-				c.mu.Lock()
-				c.expireLocked(now)
-				c.mu.Unlock()
-			case <-c.ctx.Done():
-				return
-			}
-		}
+		c.runExpiry()
 	}()
 	defer expiry.Wait()
 	delay := c.cfg.ReconnectMin
 	for c.ctx.Err() == nil {
+		started := time.Now()
 		got, err := c.watch()
 		if c.ctx.Err() != nil {
 			return
@@ -191,7 +180,10 @@ func (c *Client) run() {
 		}
 		c.signalWaitersLocked()
 		c.mu.Unlock()
-		if got {
+		// A flapping server can send its initial snapshot before closing every
+		// stream. Require a sustained connection before resetting backoff so
+		// those snapshots cannot keep a whole fleet retrying at the minimum.
+		if got && time.Since(started) >= c.cfg.ReconnectMax {
 			delay = c.cfg.ReconnectMin
 		}
 		// Jitter avoids synchronized reconnects after a shared load balancer outage.
@@ -207,6 +199,34 @@ func (c *Client) run() {
 			delay = c.cfg.ReconnectMax
 		} else {
 			delay *= 2
+		}
+	}
+}
+
+// Expiry notifies idle pools even when a stream stays open but stalls. Arm one
+// timer for the current deadline rather than waking every client periodically.
+// c.changed also signals freshness-only refreshes, so a newer observation can
+// extend or shorten the deadline without resetting healthy pool connections.
+func (c *Client) runExpiry() {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
+	for {
+		c.mu.Lock()
+		c.expireLocked(time.Now())
+		ready, until, changed := c.state.Ready, c.state.ValidUntil, c.changed
+		c.mu.Unlock()
+		var deadline <-chan time.Time
+		if ready {
+			timer.Reset(time.Until(until))
+			deadline = timer.C
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-changed:
+			timer.Stop()
+		case <-deadline:
 		}
 	}
 }

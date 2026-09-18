@@ -80,7 +80,7 @@ Policy: cnpgconnectgo.Policy{
 
 `Open` waits for discovery and the initial PostgreSQL connection. Its context
 bounds startup only; call `Close` during shutdown. `StartupTimeout` defaults to
-10 seconds and the PostgreSQL connection timeout to 5 seconds. Use normal query
+30 seconds and the PostgreSQL connection timeout to 5 seconds. Use normal query
 context deadlines to bound waits during failover.
 
 For `database/sql`, pgx owns idle connections. Leave the returned DB's idle limit
@@ -97,7 +97,7 @@ with `bun.NewDB(sqldb, pgdialect.New())`.
 | `Network` | Automatic internal-then-external selection; an explicit key pins that network |
 | `TLSConfig` | System roots, verified TLS |
 | `Token` | Empty; only needed if the server explicitly enables bearer authentication |
-| `StartupTimeout` | 10 seconds |
+| `StartupTimeout` | 30 seconds |
 | `ReconnectMin`, `ReconnectMax` | 100 milliseconds, 5 seconds |
 | `MaxSnapshotTTL` | 30 seconds |
 | `Insecure` | False; plaintext discovery for local development only |

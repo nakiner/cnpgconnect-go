@@ -17,8 +17,14 @@ Applications keep calling the same pgx pool or SQL DB throughout that process.
    obsolete member are canceled during startup, freeing their pool slots
    without waiting for the connection timeout. Borrowed connections retire
    when released if their identity is no longer eligible.
-5. If the discovery stream closes, the client reconnects with bounded backoff.
+5. If the discovery stream closes, the client reconnects with bounded, jittered backoff.
    The last snapshot remains usable only until its validity deadline.
+
+Repeated short-lived discovery streams increase the retry delay even if each
+delivers an initial snapshot. A stream that receives a valid snapshot and stays
+open for at least `ReconnectMax` resets the delay. This prevents a flapping
+discovery service from causing a fleet-wide retry storm. Snapshot expiry uses
+the advertised deadline, capped by `MaxSnapshotTTL`, without periodic polling.
 
 A snapshot refresh extends freshness without changing connection identity.
 Replacing a Pod changes its member identity even if its address is reused.

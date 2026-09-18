@@ -21,7 +21,9 @@ type Config struct {
 	TLSConfig *tls.Config
 	// Insecure explicitly enables plaintext discovery for local development.
 	// It cannot be combined with a token or TLS configuration.
-	Insecure       bool
+	Insecure bool
+	// StartupTimeout bounds the wait for initial discovery. Zero uses 30 seconds;
+	// an earlier caller deadline still takes precedence.
 	StartupTimeout time.Duration
 	ReconnectMin   time.Duration
 	ReconnectMax   time.Duration
@@ -35,7 +37,7 @@ func (c Config) normalized() (Config, error) {
 		return c, fmt.Errorf("cnpgconnect-go: discovery address and valid namespace/cluster names are required")
 	}
 	if c.StartupTimeout == 0 {
-		c.StartupTimeout = 10 * time.Second
+		c.StartupTimeout = 30 * time.Second
 	}
 	if c.ReconnectMin == 0 {
 		c.ReconnectMin = 100 * time.Millisecond

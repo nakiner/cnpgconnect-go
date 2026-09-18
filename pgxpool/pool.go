@@ -46,7 +46,7 @@ type Config struct {
 	// A zero ConnectTimeout uses 5 seconds; negative timeouts are invalid.
 	ConnConfig *native.Config
 	// StartupTimeout bounds initial connectivity checks when ctx has no deadline.
-	// Zero uses 10 seconds. A negative value is invalid.
+	// Zero uses 30 seconds. A negative value is invalid.
 	StartupTimeout time.Duration
 }
 
@@ -97,7 +97,7 @@ func Open(ctx context.Context, cfg Config) (*Pool, error) {
 		return nil, err
 	}
 	if cfg.StartupTimeout == 0 {
-		cfg.StartupTimeout = 10 * time.Second
+		cfg.StartupTimeout = 30 * time.Second
 	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc

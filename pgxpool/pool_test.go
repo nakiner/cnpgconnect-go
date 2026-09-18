@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -107,6 +108,37 @@ func TestCloseCancelsWaitingBackgroundConstructors(t *testing.T) {
 	defer resolver.mu.Unlock()
 	if len(resolver.subscribers) != 0 {
 		t.Fatal("failed startup leaked subscription")
+	}
+}
+
+func TestStartupDefaultAndEarlierCallerDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration
+		want     time.Duration
+	}{
+		{"default", 0, 30 * time.Second},
+		{"caller deadline", 200 * time.Millisecond, 200 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := context.Background()
+				if tc.deadline > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.deadline)
+					defer cancel()
+				}
+				resolver := newResolver(cnpgconnectgo.Target{})
+				started := time.Now()
+				_, err := Open(ctx, Config{Resolver: resolver, ConnConfig: testConfig(t)})
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("startup error = %v; want deadline exceeded", err)
+				}
+				if elapsed := time.Since(started); elapsed != tc.want {
+					t.Fatalf("startup took %s, want %s", elapsed, tc.want)
+				}
+			})
+		})
 	}
 }
 

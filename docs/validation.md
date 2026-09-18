@@ -1,5 +1,20 @@
 # Validation record
 
+## Unreleased reconnect and expiry improvements — 2026-09-18
+
+Current source after `v0.0.5` passed `make check`, including race tests, vet,
+all adapter examples, and integration-test compilation. Deterministic clock
+tests cover exponential jitter across repeatedly short-lived streams, reset
+after a stable stream, cancellation during receive/backoff, and freshness
+deadlines extended or shortened by a newer observation. Idle subscribers are
+notified when routing expires, without a periodic 100 ms expiry ticker.
+
+The default startup timeout is now 30 seconds in both the discovery client and
+the simple pgx pool constructor; earlier caller deadlines still apply. The
+public API and generated protobuf dependency are unchanged. These changes
+have not been deployed for a new live failover test; the earlier live records
+below remain historical validation, not acceptance of this revision.
+
 ## Rename and shared API migration — 2026-09-18
 
 After renaming the module to `github.com/nakiner/cnpgconnect-go` and switching
