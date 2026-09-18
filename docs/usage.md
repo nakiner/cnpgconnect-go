@@ -1,100 +1,129 @@
 # Configuration and reuse
 
-Import the root package as `github.com/nakiner/cnpgconnect-go` and refer to it as
-`cnpgconnectgo` in Go code. The adapters use
-`github.com/nakiner/cnpgconnect-go/pgxpool` and
-`github.com/nakiner/cnpgconnect-go/stdlib`.
-
-## Shared configuration
-
-Both database adapters accept the same configuration type:
+Both adapters share `pgxpool.Config`; `stdlib.Config` is an alias. The normal
+configuration contains only five fields:
 
 ```go
 pgxpool.Config{
-    Discovery:      discoveryConfig,
-    Resolver:       nil, // Optional caller-owned shared resolver.
-    Policy:         cnpgconnectgo.Policy{Role: cnpgconnectgo.Primary},
-    ConnConfig:     postgresConfig,
-    StartupTimeout: 10 * time.Second,
+    Address:   "discovery.example.com:443",
+    Namespace: "dev",
+    Cluster:   "rent",
+    Username:  "rent",
+    Password:  password,
 }
 ```
 
-Create `ConnConfig` with `github.com/jackc/pgx/v5/pgxpool.ParseConfig`. Database,
-username, password, runtime parameters, tracing, pool sizing, and callbacks use
-the normal pgx configuration. The adapter copies it, then changes the host, port,
-and TLS server name to the selected member. Original DSN alternative hosts do
-not bypass discovery. Keep this configuration immutable after opening.
+Namespace and cluster identify the CNPG `Cluster`, not a Pod. The plugin supplies
+the default database name, member endpoints, and public PostgreSQL server CA.
+The library verifies each server certificate against that CA using the endpoint's
+TLS server name, including when its dial address is a Pod IP. Database name or
+CA changes retire the previous pool connections on release. Passwords are only
+sent to PostgreSQL.
 
-Configure the PostgreSQL CA through the DSN's `sslrootcert` or the pgx TLS
-configuration. Use `sslmode=verify-full` for authenticated encrypted connections.
-The discovered endpoint's `serverName` permits certificate verification when the
-dial address is a Pod IP or a per-member external address.
+Discovery uses system certificate roots by default and does not require a bearer
+token. Configure its publicly trusted certificate and network access once in
+platform infrastructure. Applications do not need Kubernetes credentials or
+certificate files.
 
-The managed adapter preserves the DSN's PostgreSQL TLS policy: `prefer` tries TLS
-before plaintext, `allow` tries plaintext before TLS, `verify-full` requires
-verified TLS, and `disable` uses plaintext. Transport alternatives are retained
-only for the original primary DSN host and port, then all are redirected to the
-same discovered member. Other DSN hosts and ports are discarded. An unset
-PostgreSQL connection timeout defaults to 5 seconds; set `ConnectTimeout` on the
-native connection configuration to change this bound.
+The default network selection tries the selected member's internal address,
+then its external address when needed. An external address is also sufficient
+when no internal address is advertised. Each address uses its own verified TLS
+server name and must pass the PostgreSQL role check. An authentication failure
+is returned directly. The normal connection timeout bounds each address attempt;
+the caller's context bounds the whole operation.
 
-An `AfterConnect` hook still runs for every new PostgreSQL connection. Use it for
-session initialization that must also apply after failover. Native query tracing
-and pool instrumentation remain available. The managed `Pool` embeds the native
-pool, so it retains pgx's normal `Query`, `Exec`, `Begin`, `CopyFrom`, `SendBatch`,
-`Acquire`, and `Stat` methods. Call the managed `Close`, which also stops its
-discovery worker.
+## Pool tuning and routing
 
-The `stdlib` adapter returns a regular `*sql.DB`. It implements no ORM-specific
-abstraction, so any library accepting that type can share the same behavior.
-For Bun, use `bun.NewDB(sqldb, pgdialect.New())`, as in the
-[official Bun pgx integration](https://bun.uptrace.dev/postgres/#pgx).
+Optional `ConnConfig` uses the usual `github.com/jackc/pgx/v5/pgxpool.ParseConfig`
+configuration. It is useful for sizing, runtime parameters, query tracing, and
+session callbacks:
 
-## Discovery configuration
+```go
+postgres, err := native.ParseConfig("")
+if err != nil {
+    return err
+}
+postgres.MaxConns = 20
+postgres.AfterConnect = initializeSession
 
-| Field | Meaning | Default |
-| --- | --- | --- |
-| `Address` | gRPC target, e.g. `dns:///discovery.example.com:443` | required |
-| `Namespace`, `Cluster` | CNPG Cluster identity | required |
-| `Network` | Endpoint map key published by the plugin | `internal` |
-| `Token` | Discovery bearer token | required with TLS |
-| `TLSConfig` | Discovery CA, server name, optional client certificate | system CA roots |
-| `StartupTimeout` | Initial discovery bound, capped by an earlier context deadline | 10 seconds |
-| `ReconnectMin` | Initial stream reconnect backoff | 100 milliseconds |
-| `ReconnectMax` | Maximum reconnect backoff | 5 seconds |
-| `MaxSnapshotTTL` | Maximum accepted age measured from server observation | 30 seconds |
-| `Insecure` | Plaintext discovery for local development | false |
+pool, err := pgxpool.Open(ctx, pgxpool.Config{
+    Address: "discovery.example.com:443", Namespace: "dev", Cluster: "rent",
+    Username: user, Password: password,
+    ConnConfig: postgres,
+})
+```
 
-`Insecure` cannot be combined with a bearer token or TLS configuration. It is
-intended for a plugin started explicitly in its own insecure development mode.
-Normal discovery verifies the server certificate. Keep client and server clocks
-synchronized because topology deadlines are absolute timestamps. Observations
-more than five seconds in the future are rejected. An older observation received
-after reconnect cannot replace newer state or renew its lifetime.
+With `Username` set, application credentials and discovered database/TLS settings
+override connection settings in `ConnConfig`. TLS verification is always enabled
+in this path and it never falls back to plaintext. The configuration is copied;
+keep callbacks safe for concurrent use, as with a native pgx pool.
 
-When using a private discovery CA, load its PEM certificates into an
-`x509.CertPool` and assign `TLSConfig.RootCAs`. A `ServerName` override is useful
-for a local port-forward while still verifying the real service certificate.
+For compatibility, a `ConnConfig` supplied without `Username` keeps its own
+credentials, database, and TLS policy. Only the member host, port, and TLS name
+are replaced. This is useful for an additional database on the same CNPG cluster
+or an older discovery server; ordinary applications use the simple API above.
 
-The plugin's application listener must be reachable through the configured
-address. An external proxy must support HTTP/2 gRPC and long-lived response
-streams. The PostgreSQL endpoints must also be reachable using the selected
-`Network`; the client never silently falls back to a different network.
+`Policy` defaults to the current primary. A strict reader can use
+`cnpgconnectgo.Policy{Role: cnpgconnectgo.SyncReplica}`. Use `Fallback` to allow
+another role, for example:
+
+```go
+Policy: cnpgconnectgo.Policy{
+    Role: cnpgconnectgo.SyncReplica,
+    Fallback: []cnpgconnectgo.Role{cnpgconnectgo.Replica, cnpgconnectgo.Primary},
+},
+```
+
+`PreferZone` prefers members in a zone within the chosen role class. Roles are
+`Primary`, `Replica`, `SyncReplica`, `AsyncReplica`, `QuorumReplica`,
+`PotentialReplica`, and `Any`.
+
+`Open` waits for discovery and the initial PostgreSQL connection. Its context
+bounds startup only; call `Close` during shutdown. `StartupTimeout` defaults to
+10 seconds and the PostgreSQL connection timeout to 5 seconds. Use normal query
+context deadlines to bound waits during failover.
+
+For `database/sql`, pgx owns idle connections. Leave the returned DB's idle limit
+at zero and tune pool size through `ConnConfig`. Bun wraps the returned handle
+with `bun.NewDB(sqldb, pgdialect.New())`.
+
+## Advanced discovery settings
+
+`Discovery` optionally overrides the stream's configuration. Direct `Address`,
+`Namespace`, and `Cluster` fields take precedence when set.
+
+| Field on `cnpgconnectgo.Config` | Default |
+| --- | --- |
+| `Network` | Automatic internal-then-external selection; an explicit key pins that network |
+| `TLSConfig` | System roots, verified TLS |
+| `Token` | Empty; only needed if the server explicitly enables bearer authentication |
+| `StartupTimeout` | 10 seconds |
+| `ReconnectMin`, `ReconnectMax` | 100 milliseconds, 5 seconds |
+| `MaxSnapshotTTL` | 30 seconds |
+| `Insecure` | False; plaintext discovery for local development only |
+
+For a private organizational discovery CA already trusted by the operating
+system, no override is needed. Specialized environments can provide
+`TLSConfig.RootCAs` or a TLS server-name override. `Insecure` cannot carry a bearer
+token or a TLS configuration. The simple API never disables TLS verification.
+An external proxy must support HTTP/2 gRPC and long-lived streams; each published
+PostgreSQL member endpoint must also be reachable.
 
 ## Share one discovery stream
 
-A service with separate writer and reader pools can share a client:
+A service with writer and reader pools can share a client:
 
 ```go
-discovery, err := cnpgconnectgo.New(ctx, discoveryConfig)
+discovery, err := cnpgconnectgo.New(ctx, cnpgconnectgo.Config{
+    Address: "discovery.example.com:443", Namespace: "dev", Cluster: "rent",
+})
 if err != nil {
     return err
 }
 defer discovery.Close()
 
 writer, err := pgxpool.Open(ctx, pgxpool.Config{
-    Resolver:   discovery,
-    ConnConfig: postgresConfig,
+    Resolver: discovery, Username: user, Password: password,
 })
 if err != nil {
     return err
@@ -102,9 +131,8 @@ if err != nil {
 defer writer.Close()
 
 reader, err := stdlib.Open(ctx, stdlib.Config{
-    Resolver:   discovery,
-    ConnConfig: postgresConfig,
-    Policy:     cnpgconnectgo.Policy{Role: cnpgconnectgo.Replica},
+    Resolver: discovery, Username: user, Password: password,
+    Policy: cnpgconnectgo.Policy{Role: cnpgconnectgo.Replica},
 })
 if err != nil {
     return err
@@ -112,13 +140,10 @@ if err != nil {
 defer reader.Close()
 ```
 
-Close every pool before closing the shared client. Pool `Close` releases its
-subscription but leaves a caller-provided resolver open. Without `Resolver`, each
-pool owns and closes its own discovery client. `Client.Status()` exposes a copy
-of the current discovery state for diagnostics and health checks.
+Close the pools before their shared client. Without `Resolver`, each pool owns
+and closes its own client. `Client.Status()` provides a diagnostic snapshot.
 
-Custom adapters implement the same contract through `Resolver.Resolve`,
-`Resolver.Valid`, and `Resolver.Subscribe`. `Resolve` waits with a context;
-`Valid` checks an immutable target including member identity and routing
-generation; `Subscribe` coalesces routing-change notifications. Adapters must
-retain the selected target identity rather than infer it later from host/port.
+Custom adapters use `Resolver.Resolve`, `Resolver.Valid`, and
+`Resolver.Subscribe`. `Target` contains the endpoint, connection parameters,
+member identity, and routing generation. Retain that complete identity when
+checking whether an existing connection is still usable.

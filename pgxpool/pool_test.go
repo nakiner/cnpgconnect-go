@@ -2,6 +2,7 @@ package pgxpool
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -429,15 +430,26 @@ type postgresServer struct {
 	conns    map[net.Conn]bool
 	wg       sync.WaitGroup
 	closed   bool
+	settings postgresSettings
 }
 
-func newPostgres(t *testing.T, identity string, recovery bool) *postgresServer {
+type postgresSettings struct {
+	tls       *tls.Config
+	startup   chan map[string]string
+	password  chan string
+	authError string
+}
+
+func newPostgres(t *testing.T, identity string, recovery bool, settings ...postgresSettings) *postgresServer {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := &postgresServer{listener: listener, identity: identity, recovery: recovery, conns: make(map[net.Conn]bool)}
+	if len(settings) > 0 {
+		s.settings = settings[0]
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -482,15 +494,60 @@ func (s *postgresServer) target(generation uint64) cnpgconnectgo.Target {
 
 func (s *postgresServer) serve(conn net.Conn) {
 	defer s.wg.Done()
+	originalConn := conn
 	defer func() {
 		_ = conn.Close()
 		s.mu.Lock()
-		delete(s.conns, conn)
+		delete(s.conns, originalConn)
 		s.mu.Unlock()
 	}()
 	backend := pgproto3.NewBackend(conn, conn)
-	if _, err := backend.ReceiveStartupMessage(); err != nil {
+	message, err := backend.ReceiveStartupMessage()
+	if err != nil {
 		return
+	}
+	if _, ok := message.(*pgproto3.SSLRequest); ok {
+		if s.settings.tls == nil {
+			_, _ = conn.Write([]byte{'N'})
+			return
+		}
+		if _, err := conn.Write([]byte{'S'}); err != nil {
+			return
+		}
+		conn = tls.Server(conn, s.settings.tls)
+		backend = pgproto3.NewBackend(conn, conn)
+		message, err = backend.ReceiveStartupMessage()
+		if err != nil {
+			return
+		}
+	}
+	startup, ok := message.(*pgproto3.StartupMessage)
+	if !ok {
+		return
+	}
+	if s.settings.startup != nil {
+		s.settings.startup <- startup.Parameters
+	}
+	if s.settings.authError != "" {
+		backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Code: s.settings.authError, Message: "test authentication failure"})
+		_ = backend.Flush()
+		return
+	}
+	if s.settings.password != nil {
+		_ = backend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
+		backend.Send(&pgproto3.AuthenticationCleartextPassword{})
+		if backend.Flush() != nil {
+			return
+		}
+		message, err := backend.Receive()
+		if err != nil {
+			return
+		}
+		password, ok := message.(*pgproto3.PasswordMessage)
+		if !ok {
+			return
+		}
+		s.settings.password <- password.Password
 	}
 	backend.Send(&pgproto3.AuthenticationOk{})
 	backend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "16.0"})

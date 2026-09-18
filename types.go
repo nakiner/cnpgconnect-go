@@ -58,6 +58,13 @@ type Endpoint struct {
 	ServerName string
 }
 
+// ConnectionParameters contains public PostgreSQL connection settings supplied
+// by discovery. Credentials belong to the application and never enter discovery.
+type ConnectionParameters struct {
+	Database    string
+	ServerCAPEM string
+}
+
 // Target is a connection's immutable identity. Generation changes when this
 // member changes or the routing view is invalidated, including an expiry followed
 // by identical recovery. Unrelated member changes preserve this generation.
@@ -66,11 +73,15 @@ type Target struct {
 	MemberID   string
 	Name       string
 	Endpoint   Endpoint
-	Role       Role
-	SyncState  SyncState
-	Zone       string
-	Region     string
-	Generation uint64
+	// FallbackEndpoint is another address for this same member. It is populated
+	// for automatic network selection and remains empty for an explicit Network.
+	FallbackEndpoint Endpoint
+	Connection       ConnectionParameters
+	Role             Role
+	SyncState        SyncState
+	Zone             string
+	Region           string
+	Generation       uint64
 }
 
 // Resolver lets adapters share a discovery client or use another implementation.

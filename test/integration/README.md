@@ -1,5 +1,11 @@
 # cnpgconnect-go live CloudNativePG integration
 
+This historical fixture exercises the advanced connection configuration against
+an isolated local cluster, including optional bearer authentication. Its token,
+certificate files, and forwarding setup are test infrastructure, not requirements
+for the [normal application API](../../README.md#connect). `make check` also tests
+the simple API over real gRPC and PostgreSQL TLS sockets without a plugin token.
+
 This opt-in suite requires an existing isolated kind cluster named
 `cnpg-connect-test`. It refuses any other current kubeconfig context. The test
 does not create or delete a cluster, install an operator, or start port-forwards.

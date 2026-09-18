@@ -2,6 +2,7 @@ package cnpgconnectgo
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
@@ -146,5 +147,15 @@ func TestConfigurationDoesNotAllowCredentialLeak(t *testing.T) {
 	cfg.Token = "secret"
 	if _, err := cfg.normalized(); err == nil {
 		t.Fatal("accepted token over insecure transport")
+	}
+}
+
+func TestDiscoveryDefaultsToVerifiedTLSWithoutToken(t *testing.T) {
+	cfg, err := (Config{Address: "discovery.example.com:443", Namespace: "dev", Cluster: "rent"}).normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Token != "" || cfg.TLSConfig == nil || cfg.TLSConfig.InsecureSkipVerify || cfg.TLSConfig.RootCAs != nil || cfg.TLSConfig.MinVersion < tls.VersionTLS12 {
+		t.Fatal("default discovery does not use verified system-trust TLS without a token")
 	}
 }

@@ -1,49 +1,35 @@
 # cnpgconnect-go examples
 
-The pgx, `database/sql`, and Bun examples use the same discovery and PostgreSQL
-configuration. They connect, query the server address, and close cleanly.
-Run them from the `cnpgconnect-go` checkout with Go 1.26.4 or later.
-
-Supply credentials through your normal secret delivery mechanism. The examples
-read these environment variables:
+The pgx, `database/sql`, and Bun examples share the same five inputs:
 
 ```sh
-export PG_DSN='postgres://app@placeholder/app?sslmode=verify-full&sslrootcert=/path/to/postgres-ca.crt'
+export CNPG_DISCOVERY_ADDRESS='discovery.example.com:443'
+export CNPG_NAMESPACE='dev'
+export CNPG_CLUSTER='rent'
+export PGUSER='rent'
 export PGPASSWORD='your-postgres-password'
-export CNPG_DISCOVERY_ADDRESS='dns:///discovery.example.com:443'
-export CNPG_DISCOVERY_TOKEN_FILE='/path/to/discovery-token'
-export CNPG_DISCOVERY_CA='/path/to/discovery-ca.crt'
-export CNPG_NAMESPACE='databases'
-export CNPG_CLUSTER='app-db'
-export CNPG_NETWORK='external'
 ```
 
-`PGPASSWORD` is consumed by pgx's normal DSN parser. The placeholder host is
-replaced by a discovered member. The discovery CA and PostgreSQL CA are separate.
-If discovery uses a publicly trusted certificate, omit `CNPG_DISCOVERY_CA` to
-use system trust roots. `CNPG_DISCOVERY_SERVER_NAME` optionally overrides the
-discovery TLS name, for example during a port-forward.
+The discovery endpoint has a certificate trusted by the operating system. The
+plugin supplies the database name, PostgreSQL addresses, and server CA. No DSN,
+discovery token, or CA file is needed. Supply the PostgreSQL password using your
+usual secret delivery mechanism.
+The same configuration works outside Kubernetes when the platform has published
+reachable external member addresses. The library selects the reachable path.
 
-From the repository root:
-
-```sh
-go run ./examples/pgx
-go run ./examples/sql
-```
-
-For Bun:
+With Go 1.26.4 or later, enter the example you want to run:
 
 ```sh
-cd examples/bun
+cd examples/pgx # Or examples/sql, or examples/bun, from the checkout root.
 go run .
 ```
 
-Bun has a separate example module with a local replacement for this library. Its
-dependencies are excluded from the main library module. The example follows
-[Bun's pgx integration](https://bun.uptrace.dev/postgres/#pgx) and sets simple
-protocol for its interpolated SQL.
+The examples have separate modules; Bun does not become a library dependency.
+Each example opens a connection to the current primary, prints the PostgreSQL
+server address, and closes cleanly. A service keeps the returned handle for its
+lifetime and uses ordinary query context deadlines.
 
-The examples use the primary policy. To select replicas, set `Policy` on the
-configuration before calling the adapter's `Open` function. Service code should
-keep the returned handle for its whole lifetime and set a context deadline on
-each operation.
+The simple API requires the plugin's new connection metadata. Before matching
+releases are published, use a Go workspace with the plugin, library, and selected
+example modules. Replica routing and pool tuning are optional; see
+[configuration](../docs/usage.md).

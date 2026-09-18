@@ -17,10 +17,7 @@ func main() {
 }
 
 func run() error {
-	config, err := exampleconfig.Load()
-	if err != nil {
-		return err
-	}
+	config := exampleconfig.Load()
 	pool, err := pgxpool.Open(context.Background(), config)
 	if err != nil {
 		return err

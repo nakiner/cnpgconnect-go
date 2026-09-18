@@ -5,10 +5,12 @@ connection may use and whether an existing idle connection can be borrowed.
 Applications keep calling the same pgx pool or SQL DB throughout that process.
 
 1. The discovery client opens `WatchTopology` and accepts full snapshots for the
-   configured cluster and network.
-2. A new connection resolves an eligible member and records its identity. The
-   PostgreSQL DSN supplies authentication and database settings; discovery
-   supplies the address.
+   configured cluster. Network selection is automatic unless explicitly pinned.
+2. A new connection resolves an eligible member and records its identity. The application supplies
+   PostgreSQL credentials; discovery supplies the database name, address, and
+   server CA. TLS verifies the discovered server name before authentication.
+   It tries the same member's advertised external address if the internal path
+   fails; it does not change member or routing role to choose a reachable path.
 3. Every acquisition checks whether the connection still matches the current,
    unexpired routing policy. An obsolete connection is retired before use.
 4. Role changes and expiry wake pool maintenance. Borrowed connections retire
@@ -18,6 +20,7 @@ Applications keep calling the same pgx pool or SQL DB throughout that process.
 
 A snapshot refresh extends freshness without changing connection identity.
 Replacing a Pod changes its member identity even if its address is reused.
+Database name and server CA changes also invalidate the previous connections.
 There is no Kubernetes watch or Kubernetes authentication in application code.
 
 When a policy has several eligible members, each new connection chooses one

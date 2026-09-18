@@ -13,7 +13,10 @@ type Config struct {
 	Address   string
 	Namespace string
 	Cluster   string
-	Network   string
+	// Network optionally pins an advertised endpoint map entry. When omitted,
+	// adapters try the member's internal address, then its external address.
+	Network string
+	// Token is optional, for discovery servers configured with bearer auth.
 	Token     string
 	TLSConfig *tls.Config
 	// Insecure explicitly enables plaintext discovery for local development.
@@ -30,9 +33,6 @@ type Config struct {
 func (c Config) normalized() (Config, error) {
 	if strings.TrimSpace(c.Address) == "" || !resourceName(c.Namespace) || !resourceName(c.Cluster) {
 		return c, fmt.Errorf("cnpgconnect-go: discovery address and valid namespace/cluster names are required")
-	}
-	if c.Network == "" {
-		c.Network = "internal"
 	}
 	if c.StartupTimeout == 0 {
 		c.StartupTimeout = 10 * time.Second
@@ -54,8 +54,8 @@ func (c Config) normalized() (Config, error) {
 			return c, fmt.Errorf("cnpgconnect-go: insecure discovery cannot carry TLS configuration or credentials")
 		}
 	} else {
-		if strings.TrimSpace(c.Token) == "" || strings.ContainsAny(c.Token, "\r\n\t ") {
-			return c, fmt.Errorf("cnpgconnect-go: a nonempty bearer token without whitespace is required")
+		if strings.ContainsAny(c.Token, "\r\n\t ") {
+			return c, fmt.Errorf("cnpgconnect-go: bearer token must not contain whitespace")
 		}
 		if c.TLSConfig == nil {
 			c.TLSConfig = &tls.Config{}

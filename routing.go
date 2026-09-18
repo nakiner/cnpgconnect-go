@@ -195,7 +195,7 @@ func (c *Client) validateSnapshot(s *connectv1.Snapshot, now time.Time) ([]Targe
 	until = minTime(until, at.Add(c.cfg.MaxSnapshotTTL))
 	ids := map[string]bool{}
 	names := map[string]bool{}
-	endpoints := map[string]bool{}
+	endpoints := map[string]string{}
 	var result []Target
 	primaries := 0
 	for _, m := range s.Members {
@@ -207,7 +207,14 @@ func (c *Client) validateSnapshot(s *connectv1.Snapshot, now time.Time) ([]Targe
 		if !m.Ready {
 			continue
 		}
-		t := Target{ClusterUID: s.Cluster.Uid, MemberID: m.Id, Name: m.Name, Zone: m.Zone, Region: m.Region, SyncState: SyncUnknown}
+		t := Target{
+			ClusterUID: s.Cluster.Uid, MemberID: m.Id, Name: m.Name,
+			Zone: m.Zone, Region: m.Region, SyncState: SyncUnknown,
+			Connection: ConnectionParameters{
+				Database:    s.GetConnection().GetDatabase(),
+				ServerCAPEM: string(s.GetConnection().GetServerCaPem()),
+			},
+		}
 		switch m.Role {
 		case connectv1.Role_ROLE_PRIMARY:
 			primaries++
@@ -232,19 +239,33 @@ func (c *Client) validateSnapshot(s *connectv1.Snapshot, now time.Time) ([]Targe
 		default:
 			return bad("eligible member has unknown role")
 		}
-		ep, ok := m.Endpoints[c.cfg.Network]
-		if !ok {
+		networks := []string{c.cfg.Network}
+		if c.cfg.Network == "" {
+			networks = []string{"internal", "external"}
+		}
+		for _, network := range networks {
+			ep, ok := m.Endpoints[network]
+			if !ok {
+				continue
+			}
+			if ep == nil || ep.Host == "" || ep.Port == 0 || ep.Port > 65535 || strings.ContainsAny(ep.Host, " /\\\t\r\n") || (strings.Contains(ep.Host, ":") && net.ParseIP(ep.Host) == nil) || strings.ContainsAny(ep.ServerName, " /\\\t\r\n") {
+				return bad("invalid endpoint")
+			}
+			address := net.JoinHostPort(strings.ToLower(ep.Host), fmt.Sprint(ep.Port))
+			if owner, exists := endpoints[address]; exists && owner != m.Id {
+				return bad("multiple members share an endpoint")
+			}
+			endpoints[address] = m.Id
+			endpoint := Endpoint{Host: ep.Host, Port: uint16(ep.Port), ServerName: ep.ServerName}
+			if t.Endpoint.Host == "" {
+				t.Endpoint = endpoint
+			} else if endpoint != t.Endpoint {
+				t.FallbackEndpoint = endpoint
+			}
+		}
+		if t.Endpoint.Host == "" {
 			continue
-		} // Never cross networks implicitly.
-		if ep == nil || ep.Host == "" || ep.Port == 0 || ep.Port > 65535 || strings.ContainsAny(ep.Host, " /\\\t\r\n") || (strings.Contains(ep.Host, ":") && net.ParseIP(ep.Host) == nil) || strings.ContainsAny(ep.ServerName, " /\\\t\r\n") {
-			return bad("invalid endpoint")
 		}
-		address := net.JoinHostPort(strings.ToLower(ep.Host), fmt.Sprint(ep.Port))
-		if endpoints[address] {
-			return bad("multiple members share an endpoint")
-		}
-		endpoints[address] = true
-		t.Endpoint = Endpoint{Host: ep.Host, Port: uint16(ep.Port), ServerName: ep.ServerName}
 		result = append(result, t)
 	}
 	if s.Available && !s.Transitioning && (primaries != 1 || s.PrimaryId == "") {

@@ -127,6 +127,72 @@ func TestUnrelatedReplicaChangePreservesPrimaryConnection(t *testing.T) {
 	}
 }
 
+func TestConnectionMetadataChangesInvalidateExistingConnections(t *testing.T) {
+	c := testClient()
+	s := snapshot(time.Now())
+	s.Connection = &connectv1.ConnectionParameters{Database: "rent", ServerCaPem: []byte("first CA")}
+	if err := c.accept(s, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	updates, stop := c.Subscribe()
+	defer stop()
+	<-updates
+	for _, mutate := range []func(){
+		func() { s.Connection.Database = "rent_data" },
+		func() { s.Connection.ServerCaPem = []byte("rotated CA") },
+	} {
+		previous, err := c.Resolve(context.Background(), Policy{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutate()
+		if err := c.accept(s, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if c.Valid(Policy{}, previous) {
+			t.Fatal("connection survived changed database/CA metadata")
+		}
+		current, err := c.Resolve(context.Background(), Policy{})
+		if err != nil || current.Connection.Database != s.Connection.Database || current.Connection.ServerCAPEM != string(s.Connection.ServerCaPem) {
+			t.Fatalf("new connection metadata = %+v, %v", current.Connection, err)
+		}
+		select {
+		case <-updates:
+		default:
+			t.Fatal("pool not notified of connection metadata change")
+		}
+	}
+}
+
+func TestAutomaticNetworkTargetsAndEndpointChanges(t *testing.T) {
+	c := testClient()
+	c.cfg.Network = ""
+	s := snapshot(time.Now())
+	s.Members[0].Endpoints["external"] = &connectv1.Endpoint{Host: "primary.example.com", Port: 6432, ServerName: "app.test"}
+	if err := c.accept(s, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	target, err := c.Resolve(context.Background(), Policy{})
+	if err != nil || target.Endpoint.Host != "p1.test" || target.FallbackEndpoint.Host != "primary.example.com" {
+		t.Fatalf("automatic target = %+v, %v", target, err)
+	}
+	s.Members[0].Endpoints["external"].Host = "new-primary.example.com"
+	if err := c.accept(s, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if c.Valid(Policy{}, target) {
+		t.Fatal("changed external endpoint did not invalidate previous target")
+	}
+	delete(s.Members[0].Endpoints, "internal")
+	if err := c.accept(s, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	target, err = c.Resolve(context.Background(), Policy{})
+	if err != nil || target.Endpoint.Host != "new-primary.example.com" || target.FallbackEndpoint.Host != "" {
+		t.Fatalf("external-only target = %+v, %v", target, err)
+	}
+}
+
 func TestUnavailablePolicyWaitsAndRecovers(t *testing.T) {
 	c := testClient()
 	s := snapshot(time.Now())

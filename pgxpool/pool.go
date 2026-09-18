@@ -7,6 +7,7 @@ package pgxpool
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -19,17 +20,28 @@ import (
 	"github.com/nakiner/cnpgconnect-go"
 )
 
-// Config combines discovery and routing with a normal pgx pool configuration.
+// Config connects using a discovery address, cluster identity, and PostgreSQL
+// credentials. Discovery supplies the database name, endpoints, and server CA.
+// The zero policy follows the primary. stdlib.Config is the same type.
 type Config struct {
+	Address   string
+	Namespace string
+	Cluster   string
+	Username  string
+	Password  string
+
+	// Discovery optionally customizes transport, network, and stream settings.
+	// Address, Namespace, and Cluster above take precedence when provided.
 	Discovery cnpgconnectgo.Config
 	// Resolver optionally shares an existing discovery client across pools. The
 	// caller owns this resolver and must close it after all its pools are closed.
 	Resolver cnpgconnectgo.Resolver
 	Policy   cnpgconnectgo.Policy
-	// ConnConfig must originate from pgxpool.ParseConfig. It supplies PostgreSQL
-	// credentials, database, TLS policy, tracing, hooks, and pool sizing. The
-	// discovered member replaces its host, port, and TLS server name. TLS mode
-	// fallbacks are preserved for that member; other DSN hosts are discarded.
+	// ConnConfig optionally supplies tracing, hooks, runtime parameters, and pool
+	// sizing. It must originate from pgxpool.ParseConfig. With Username set,
+	// credentials and discovered database/TLS settings override its values.
+	// For legacy configurations with no Username, ConnConfig also supplies the
+	// credentials, database, and TLS policy; discovery replaces only endpoints.
 	// A zero ConnectTimeout uses 5 seconds; negative timeouts are invalid.
 	ConnConfig *native.Config
 	// StartupTimeout bounds initial connectivity checks when ctx has no deadline.
@@ -41,23 +53,37 @@ type Config struct {
 // and instrumentation interfaces. Close also stops discovery owned by this pool.
 type Pool struct {
 	*native.Pool
-	resolver cnpgconnectgo.Resolver
-	policy   cnpgconnectgo.Policy
-	owned    *cnpgconnectgo.Client
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stop     func()
-	done     chan struct{}
-	close    sync.Once
-	mu       sync.RWMutex
-	targets  map[*pgconn.PgConn]cnpgconnectgo.Target
+	resolver            cnpgconnectgo.Resolver
+	policy              cnpgconnectgo.Policy
+	owned               *cnpgconnectgo.Client
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	stop                func()
+	done                chan struct{}
+	close               sync.Once
+	mu                  sync.RWMutex
+	targets             map[*pgconn.PgConn]cnpgconnectgo.Target
+	automaticConnection bool
 }
 
 // Open waits for a usable topology and a PostgreSQL connection. Cancellation of
 // ctx bounds startup only; call Close to stop a successfully opened pool.
 func Open(ctx context.Context, cfg Config) (*Pool, error) {
-	if cfg.ConnConfig == nil || cfg.ConnConfig.ConnConfig == nil {
-		return nil, errors.New("cnpgconnect-go/pgxpool: ConnConfig from pgxpool.ParseConfig is required")
+	automaticConnection := cfg.Username != "" || cfg.ConnConfig == nil
+	if automaticConnection && cfg.Username == "" {
+		return nil, errors.New("cnpgconnect-go/pgxpool: Username is required")
+	}
+	if cfg.ConnConfig == nil {
+		// ParseConfig initializes pgx's hooks and pool defaults. TLS is installed
+		// from authenticated discovery before every connection is established.
+		var err error
+		cfg.ConnConfig, err = native.ParseConfig("sslmode=disable")
+		if err != nil {
+			return nil, fmt.Errorf("cnpgconnect-go/pgxpool: initialize connection: %w", err)
+		}
+	}
+	if cfg.ConnConfig.ConnConfig == nil {
+		return nil, errors.New("cnpgconnect-go/pgxpool: ConnConfig must originate from pgxpool.ParseConfig")
 	}
 	if cfg.StartupTimeout < 0 {
 		return nil, errors.New("cnpgconnect-go/pgxpool: StartupTimeout must not be negative")
@@ -78,15 +104,25 @@ func Open(ctx context.Context, cfg Config) (*Pool, error) {
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
 	p := &Pool{
-		resolver: cfg.Resolver,
-		policy:   cfg.Policy,
-		ctx:      lifetime,
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		targets:  make(map[*pgconn.PgConn]cnpgconnectgo.Target),
+		resolver:            cfg.Resolver,
+		policy:              cfg.Policy,
+		ctx:                 lifetime,
+		cancel:              cancel,
+		done:                make(chan struct{}),
+		targets:             make(map[*pgconn.PgConn]cnpgconnectgo.Target),
+		automaticConnection: automaticConnection,
 	}
 	p.policy.Fallback = append([]cnpgconnectgo.Role(nil), cfg.Policy.Fallback...)
 	if p.resolver == nil {
+		if cfg.Address != "" {
+			cfg.Discovery.Address = cfg.Address
+		}
+		if cfg.Namespace != "" {
+			cfg.Discovery.Namespace = cfg.Namespace
+		}
+		if cfg.Cluster != "" {
+			cfg.Discovery.Cluster = cfg.Cluster
+		}
 		client, err := cnpgconnectgo.New(ctx, cfg.Discovery)
 		if err != nil {
 			cancel()
@@ -95,6 +131,10 @@ func Open(ctx context.Context, cfg Config) (*Pool, error) {
 		p.owned, p.resolver = client, client
 	}
 	poolConfig := cfg.ConnConfig.Copy()
+	if automaticConnection {
+		poolConfig.ConnConfig.User = cfg.Username
+		poolConfig.ConnConfig.Password = cfg.Password
+	}
 	if poolConfig.ConnConfig.ConnectTimeout == 0 {
 		poolConfig.ConnConfig.ConnectTimeout = 5 * time.Second
 	}
@@ -196,7 +236,14 @@ func (p *Pool) installHooks(cfg *native.Config) {
 		if err != nil {
 			return fmt.Errorf("cnpgconnect-go/pgxpool: resolve member: %w", err)
 		}
-		setEndpoint(cc, target.Endpoint)
+		if p.automaticConnection {
+			if err := setDiscoveredConnection(cc, target); err != nil {
+				return err
+			}
+		} else {
+			setEndpoint(cc, target.Endpoint)
+			appendEndpointFallback(cc, target.FallbackEndpoint)
+		}
 		// pgx's background minimum-pool constructors are not canceled by pool
 		// shutdown. Bound DNS/dial and connect hooks as well as the native
 		// network startup timeout, and tie cooperative callbacks to our lifetime.
@@ -212,13 +259,29 @@ func (p *Pool) installHooks(cfg *native.Config) {
 			defer cancel()
 			return dial(ctx, network, address)
 		}
+		pgValidateConnect := cc.Config.ValidateConnect
+		cc.Config.ValidateConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
+			ctx, cancel := p.connectionContext(ctx, cc.ConnectTimeout)
+			defer cancel()
+			// Validate per address so pgx may try the same member's other
+			// advertised endpoint when one leads to an obsolete PostgreSQL role.
+			if err := validateRole(ctx, conn, target); err != nil {
+				return err
+			}
+			if pgValidateConnect != nil {
+				if err := pgValidateConnect(ctx, conn); err != nil {
+					return err
+				}
+			}
+			if !p.resolver.Valid(p.policy, target) {
+				return errors.New("cnpgconnect-go/pgxpool: topology changed while connecting")
+			}
+			return nil
+		}
 		pgAfterConnect := cc.Config.AfterConnect
 		cc.Config.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
 			ctx, cancel := p.connectionContext(ctx, cc.ConnectTimeout)
 			defer cancel()
-			if err := validateRole(ctx, conn, target); err != nil {
-				return err
-			}
 			if pgAfterConnect != nil {
 				if err := pgAfterConnect(ctx, conn); err != nil {
 					return err
@@ -353,6 +416,40 @@ func setEndpoint(cfg *pgx.ConnConfig, endpoint cnpgconnectgo.Endpoint) {
 	cfg.Host, cfg.Port = endpoint.Host, endpoint.Port
 	cfg.Fallbacks = fallbacks
 	cfg.TLSConfig = endpointTLS(cfg.TLSConfig, endpoint)
+}
+
+func setDiscoveredConnection(cfg *pgx.ConnConfig, target cnpgconnectgo.Target) error {
+	if target.Connection.Database == "" {
+		return errors.New("cnpgconnect-go/pgxpool: discovery did not provide a database name; upgrade/configure cnpg-connect-plugin")
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM([]byte(target.Connection.ServerCAPEM)) {
+		return errors.New("cnpgconnect-go/pgxpool: discovery did not provide a valid PostgreSQL server CA")
+	}
+	cfg.Database = target.Connection.Database
+	cfg.Host, cfg.Port = target.Endpoint.Host, target.Endpoint.Port
+	cfg.TLSConfig = endpointTLS(&tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, target.Endpoint)
+	// Never retry over plaintext or an address outside the selected member.
+	cfg.Fallbacks = nil
+	appendEndpointFallback(cfg, target.FallbackEndpoint)
+	return nil
+}
+
+func appendEndpointFallback(cfg *pgx.ConnConfig, endpoint cnpgconnectgo.Endpoint) {
+	if endpoint.Host == "" {
+		return
+	}
+	transports := append([]*pgconn.FallbackConfig(nil), cfg.Fallbacks...)
+	cfg.Fallbacks = append(cfg.Fallbacks, &pgconn.FallbackConfig{
+		Host: endpoint.Host, Port: endpoint.Port, TLSConfig: endpointTLS(cfg.TLSConfig, endpoint),
+	})
+	// Legacy explicit TLS modes retain their transport alternatives, always
+	// directed at this member. Automatic connections have verified TLS only.
+	for _, transport := range transports {
+		cfg.Fallbacks = append(cfg.Fallbacks, &pgconn.FallbackConfig{
+			Host: endpoint.Host, Port: endpoint.Port, TLSConfig: endpointTLS(transport.TLSConfig, endpoint),
+		})
+	}
 }
 
 func endpointTLS(config *tls.Config, endpoint cnpgconnectgo.Endpoint) *tls.Config {

@@ -6,7 +6,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/nakiner/cnpgconnect-go/examples/internal/exampleconfig"
 	"github.com/nakiner/cnpgconnect-go/stdlib"
 	"github.com/uptrace/bun"
@@ -20,13 +19,7 @@ func main() {
 }
 
 func run() error {
-	config, err := exampleconfig.Load()
-	if err != nil {
-		return err
-	}
-	// Bun interpolates its own placeholders. Simple protocol avoids retaining
-	// implicit prepared statements it does not need.
-	config.ConnConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	config := exampleconfig.Load()
 	sqldb, err := stdlib.Open(context.Background(), config)
 	if err != nil {
 		return err
