@@ -1,6 +1,6 @@
 # cnpgconnect-go examples
 
-The pgx, `database/sql`, and Bun examples share the same five inputs:
+The pgx, `database/sql`, Bun, and role-routing examples share the same five inputs:
 
 ```sh
 export CNPG_DISCOVERY_ADDRESS='discovery.example.com:443'
@@ -17,17 +17,33 @@ usual secret delivery mechanism.
 The same configuration works outside Kubernetes when the platform has published
 reachable external member addresses. The library selects the reachable path.
 
-With Go 1.26.4 or later, enter the example you want to run:
+For an in-cluster plugin serving plaintext gRPC, use its DNS target and set the
+optional transport variable. PostgreSQL TLS verification stays enabled:
+
+```sh
+export CNPG_DISCOVERY_ADDRESS='dns:///cnpg-connect-api.cnpg-system.svc.cluster.local:443'
+export CNPG_DISCOVERY_INSECURE=true
+```
+
+With Go 1.26.8 or later, enter the example you want to run:
 
 ```sh
 cd examples/pgx # Or examples/sql, or examples/bun, from the checkout root.
 go run .
 ```
 
-The examples have separate modules; Bun does not become a library dependency.
-Each example opens a connection to the current primary, prints the PostgreSQL
-server address, and closes cleanly. A service keeps the returned handle for its
-lifetime and uses ordinary query context deadlines.
+The pgx, SQL, and Bun examples have separate modules; Bun does not become a
+library dependency. Each opens a connection to the current primary, prints the
+PostgreSQL server address, and closes cleanly. A service keeps the returned handle
+for its lifetime and uses ordinary query context deadlines.
+
+For connections to primary and a synchronous replica, see the
+[role-routing example](roles/README.md). It shares one discovery stream between
+two pools and prints each server address and recovery state:
+
+```sh
+go run ./examples/roles # From the checkout root.
+```
 
 The simple API requires the plugin's new connection metadata. Before matching
 releases are published, use a Go workspace with the plugin, library, and selected

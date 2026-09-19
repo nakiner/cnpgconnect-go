@@ -78,6 +78,10 @@ Policy: cnpgconnectgo.Policy{
 `Primary`, `Replica`, `SyncReplica`, `AsyncReplica`, `QuorumReplica`,
 `PotentialReplica`, and `Any`.
 
+For a minimal primary-and-sync connection example, see the
+[role-routing example](../examples/roles/README.md). Selecting a replication role
+does not itself wait for that standby to replay a write.
+
 `Open` waits for discovery and the initial PostgreSQL connection. Its context
 bounds startup only; call `Close` during shutdown. `StartupTimeout` defaults to
 30 seconds and the PostgreSQL connection timeout to 5 seconds. Use normal query

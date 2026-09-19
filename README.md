@@ -86,6 +86,9 @@ Primary is the default. Set `Policy` for a reader pool, for example
 primary, replica, sync, async, quorum, and potential. Fallbacks are optional and
 explicit.
 
+The [runnable role-routing example](examples/roles/README.md) connects to primary
+and a synchronous replica using two pools sharing one discovery stream.
+
 Existing pgx pool sizing, tracing, and callbacks remain available through the
 optional `ConnConfig`. Discovery transport overrides and shared resolvers are
 also optional. See [configuration](docs/usage.md) for those advanced cases.

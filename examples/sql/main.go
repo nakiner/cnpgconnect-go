@@ -17,7 +17,10 @@ func main() {
 }
 
 func run() error {
-	config := exampleconfig.Load()
+	config, err := exampleconfig.Load()
+	if err != nil {
+		return err
+	}
 	db, err := stdlib.Open(context.Background(), config)
 	if err != nil {
 		return err
