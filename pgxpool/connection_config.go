@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,6 +39,21 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 		setEndpoint(cc, connectionTarget.Endpoint)
 		appendEndpointFallback(cc, connectionTarget.FallbackEndpoint)
 	}
+	// pgx tries addresses serially within each constructor, even after hook
+	// failures. Remember the first failure so a fallback cannot rerun the hook.
+	// CancelRequest can reuse these callbacks concurrently during cleanup.
+	var hookFailure atomic.Pointer[startupHookError]
+	recordHookError := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		hookFailure.CompareAndSwap(nil, &startupHookError{err})
+		return hookFailure.Load()
+	}
+	wrapTLSHooks(cc.TLSConfig, recordHookError)
+	for _, fallback := range cc.Fallbacks {
+		wrapTLSHooks(fallback.TLSConfig, recordHookError)
+	}
 	// pgx's connection tracer supplies the context for the entire startup,
 	// including TLS/authentication between DialFunc and ValidateConnect.
 	// Keep application tracing while allowing obsolete attempts to stop as
@@ -46,7 +62,8 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 	if cc.Tracer != nil {
 		tracer = multitracer.New(cc.Tracer)
 	}
-	tracer.ConnectTracers = append(tracer.ConnectTracers, connectionTracer{pool: p, target: target})
+	startup, _ := ctx.Value(startupRetryKey{}).(*startupRetry)
+	tracer.ConnectTracers = append(tracer.ConnectTracers, connectionTracer{pool: p, target: target, startup: startup})
 	cc.Tracer = tracer
 	// pgx's background minimum-pool constructors are not canceled by pool
 	// shutdown. Bound DNS/dial and connect hooks as well as the native
@@ -65,6 +82,11 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 	}
 	dial := cc.DialFunc
 	cc.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		// Only block connection attempts; pgx also uses this dialer for
+		// cancellation requests during asynchronous connection cleanup.
+		if err := hookFailure.Load(); err != nil && ctx.Value(connectionAttemptKey{}) != nil {
+			return nil, err
+		}
 		ctx, cancel := p.connectionContext(ctx, cc.ConnectTimeout)
 		defer cancel()
 		paths.dialed(address)
@@ -73,13 +95,13 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 	if afterNetConnect := cc.Config.AfterNetConnect; afterNetConnect != nil {
 		cc.Config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
 			conn, err := afterNetConnect(ctx, config, conn)
-			return conn, hookError(err)
+			return conn, recordHookError(err)
 		}
 	}
 	if token := cc.Config.OAuthTokenProvider; token != nil {
 		cc.Config.OAuthTokenProvider = func(ctx context.Context) (string, error) {
 			value, err := token(ctx)
-			return value, hookError(err)
+			return value, recordHookError(err)
 		}
 	}
 	pgValidateConnect := cc.Config.ValidateConnect
@@ -93,7 +115,7 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 		}
 		if pgValidateConnect != nil {
 			if err := pgValidateConnect(ctx, conn); err != nil {
-				return &startupHookError{err}
+				return recordHookError(err)
 			}
 		}
 		if !p.resolver.Valid(p.policy, target) {
@@ -107,7 +129,7 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 		defer cancel()
 		if pgAfterConnect != nil {
 			if err := pgAfterConnect(ctx, conn); err != nil {
-				return &startupHookError{err}
+				return recordHookError(err)
 			}
 		}
 		p.mu.Lock()
@@ -184,6 +206,19 @@ func endpointTLS(config *tls.Config, endpoint cnpgconnectgo.Endpoint) *tls.Confi
 		return nil
 	}
 	config = config.Clone()
+	config.ServerName = endpoint.ServerName
+	if config.ServerName == "" {
+		config.ServerName = endpoint.Host
+	}
+	return config
+}
+
+// Endpoint TLS configs are already cloned for this constructor. Share its
+// hook-failure recorder across every address and transport fallback.
+func wrapTLSHooks(config *tls.Config, hookError func(error) error) {
+	if config == nil {
+		return
+	}
 	// TLS verification callbacks are application policy. An EOF from one must
 	// not be mistaken for a transient wire failure during initial pool startup.
 	if verify := config.VerifyPeerCertificate; verify != nil {
@@ -202,11 +237,11 @@ func endpointTLS(config *tls.Config, endpoint cnpgconnectgo.Endpoint) *tls.Confi
 			return cert, hookError(err)
 		}
 	}
-	config.ServerName = endpoint.ServerName
-	if config.ServerName == "" {
-		config.ServerName = endpoint.Host
+	if verify := config.EncryptedClientHelloRejectionVerify; verify != nil {
+		config.EncryptedClientHelloRejectionVerify = func(state tls.ConnectionState) error {
+			return hookError(verify(state))
+		}
 	}
-	return config
 }
 
 func validateRole(ctx context.Context, conn *pgconn.PgConn, target cnpgconnectgo.Target) error {

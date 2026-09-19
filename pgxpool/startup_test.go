@@ -101,7 +101,7 @@ func TestStartupRetryClassificationWithOptionalDNS(t *testing.T) {
 		{"empty_join_and_eof", errors.Join(emptyStartupError{}, io.EOF), false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := transientConnectError(test.err); got != test.want {
+			if got := transientConnectError(test.err, false); got != test.want {
 				t.Fatalf("transientConnectError(%v)=%v, want %v", test.err, got, test.want)
 			}
 		})
@@ -110,6 +110,7 @@ func TestStartupRetryClassificationWithOptionalDNS(t *testing.T) {
 		"authentication": &pgconn.PgError{Code: "28P01"},
 		"tls":            &tls.CertificateVerificationError{Err: io.EOF},
 		"hook":           &startupHookError{io.EOF},
+		"canceled_hook":  &startupHookError{context.Canceled},
 	} {
 		t.Run(name, func(t *testing.T) {
 			// Lookup callbacks can themselves return joined or nested errors.
@@ -117,8 +118,11 @@ func TestStartupRetryClassificationWithOptionalDNS(t *testing.T) {
 			joined := &optionalLookupError{errors.Join(dns, hardStop)}
 			nested := &optionalLookupError{&net.DNSError{IsNotFound: true, UnwrapErr: hardStop}}
 			for _, err := range []error{errors.Join(optionalDNS, hardStop), joined, nested} {
-				if transientConnectError(errors.Join(io.EOF, err)) {
+				if transientConnectError(errors.Join(io.EOF, err), false) {
 					t.Fatalf("hard stop was hidden by optional DNS: %v", err)
+				}
+				if transientConnectError(errors.Join(context.Canceled, err), true) {
+					t.Fatalf("hard stop was hidden by topology cancellation: %v", err)
 				}
 			}
 		})
@@ -187,7 +191,7 @@ func TestStartupDoesNotRetryApplicationHookErrors(t *testing.T) {
 	if connectionErr == nil {
 		t.Fatal("fixture did not return a connection error")
 	}
-	for _, path := range []string{"single_address", "missing_internal_dns"} {
+	for _, path := range []string{"single_address", "missing_internal_dns", "usable_fallback"} {
 		t.Run(path, func(t *testing.T) {
 			for _, hook := range []string{"before_connect", "after_net_connect", "validate_connect", "pgconn_after_connect", "after_connect", "prepare_conn", "oauth_token"} {
 				t.Run(hook, func(t *testing.T) {
@@ -218,6 +222,8 @@ func TestStartupDoesNotRetryApplicationHookErrors(t *testing.T) {
 					target := server.target(1)
 					if path == "missing_internal_dns" {
 						target = missingInternalEndpoint(cfg.ConnConfig, target)
+					} else if path == "usable_fallback" {
+						target.FallbackEndpoint = newPostgres(t, "fallback", false).target(1).Endpoint
 					}
 					pool, err := Open(context.Background(), Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second})
 					if pool != nil || !errors.Is(err, connectionErr) || calls.Load() != 1 {
@@ -230,9 +236,12 @@ func TestStartupDoesNotRetryApplicationHookErrors(t *testing.T) {
 }
 
 func TestStartupDoesNotRetryAuthenticationOrTLSVerification(t *testing.T) {
-	for _, path := range []string{"single_address", "missing_internal_dns"} {
+	for _, path := range []string{"single_address", "missing_internal_dns", "usable_fallback"} {
 		t.Run(path, func(t *testing.T) {
 			for _, mode := range []string{"authentication", "wrong_server_name", "verify_peer", "verify_connection", "client_certificate"} {
+				if path == "usable_fallback" && (mode == "authentication" || mode == "wrong_server_name") {
+					continue
+				}
 				t.Run(mode, func(t *testing.T) {
 					serverTLS, ca := testCertificate(t, "pg.test")
 					settings := postgresSettings{tls: serverTLS}
@@ -269,6 +278,9 @@ func TestStartupDoesNotRetryAuthenticationOrTLSVerification(t *testing.T) {
 					}
 					if path == "missing_internal_dns" {
 						target = missingInternalEndpoint(cfg.ConnConfig, target)
+					} else if path == "usable_fallback" {
+						target.FallbackEndpoint = newPostgres(t, "fallback", false, settings).target(1).Endpoint
+						target.FallbackEndpoint.ServerName = "pg.test"
 					}
 					pool, err := Open(context.Background(), Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second})
 					if pool != nil || err == nil || attempts.Load() != 1 {
