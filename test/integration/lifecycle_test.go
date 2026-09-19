@@ -113,7 +113,7 @@ func TestLiveLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	phaseCtx, phaseCancel := context.WithTimeout(ctx, 3*time.Minute)
-	target, err := discovery.Resolve(phaseCtx, cnpgconnectgo.Policy{Role: cnpgconnectgo.SyncReplica})
+	_, err = discovery.Resolve(phaseCtx, cnpgconnectgo.Policy{Role: cnpgconnectgo.SyncReplica})
 	phaseCancel()
 	if err != nil {
 		t.Fatalf("wait for synchronous replica: %v", err)
@@ -132,12 +132,35 @@ func TestLiveLifecycle(t *testing.T) {
 	if err != nil || !inRecovery || replicaAddress == oldAddress {
 		t.Fatalf("synchronous replica query: address=%q recovery=%v err=%v", replicaAddress, inRecovery, err)
 	}
-	t.Logf("strict synchronous policy selected standby %s (%s)", target.Name, replicaAddress)
+	t.Logf("strict synchronous pool queried standby %s", replicaAddress)
 
+	// The synchronous member can change between acquisitions. Bind the expected
+	// promoted server to this exact target, independently of the pool check.
+	phaseCtx, phaseCancel = context.WithTimeout(ctx, 3*time.Minute)
+	target, err := discovery.Resolve(phaseCtx, cnpgconnectgo.Policy{Role: cnpgconnectgo.SyncReplica})
+	phaseCancel()
+	if err != nil {
+		t.Fatalf("select synchronous promotion target: %v", err)
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	direct, err := connectTarget(probeCtx, config, target)
+	if err != nil {
+		probeCancel()
+		t.Fatalf("connect to promotion target %s: %v", target.Name, err)
+	}
+	err = direct.QueryRow(probeCtx, serverQuery).Scan(&replicaAddress, &inRecovery)
+	_ = direct.Close(probeCtx)
+	probeCancel()
+	if err != nil || !inRecovery || replicaAddress == oldAddress {
+		t.Fatalf("promotion target %s: address=%q recovery=%v err=%v", target.Name, replicaAddress, inRecovery, err)
+	}
+	t.Logf("promoting synchronous target %s (%s)", target.Name, replicaAddress)
+
+	recoveryStarted := time.Now()
 	if err := h.promote(ctx, target); err != nil {
 		t.Fatal(err)
 	}
-	newAddress := waitWriters(t, ctx, writer, db, stmt, oldAddress, "planned switchover")
+	newAddress := waitWriters(t, ctx, writer, db, stmt, oldAddress, "planned switchover", recoveryStarted)
 	if newAddress != replicaAddress {
 		t.Fatalf("promoted address %q, want selected standby %q", newAddress, replicaAddress)
 	}
@@ -161,10 +184,11 @@ func TestLiveLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		recoveryStarted = time.Now()
 		if err := h.deletePrimary(ctx, primary); err != nil {
 			t.Fatal(err)
 		}
-		failedOver := waitWriters(t, ctx, writer, db, stmt, newAddress, "primary Pod deletion")
+		failedOver := waitWriters(t, ctx, writer, db, stmt, newAddress, "primary Pod deletion", recoveryStarted)
 		if _, err := writer.Exec(ctx, "insert into "+table+" values (3)"); err != nil {
 			t.Fatal(err)
 		}
@@ -173,12 +197,36 @@ func TestLiveLifecycle(t *testing.T) {
 	}
 }
 
-func waitWriters(t *testing.T, parent context.Context, writer *managed.Pool, db *sql.DB, stmt *sql.Stmt, previous, description string) string {
+func connectTarget(ctx context.Context, config managed.Config, target cnpgconnectgo.Target) (*pgx.Conn, error) {
+	cc := config.ConnConfig.ConnConfig.Copy()
+	cc.Host, cc.Port, cc.Fallbacks = target.Endpoint.Host, target.Endpoint.Port, nil
+	if cc.TLSConfig != nil {
+		cc.TLSConfig.ServerName = target.Endpoint.ServerName
+	}
+	cc.RuntimeParams["application_name"] += "_probe"
+	return pgx.ConnectConfig(ctx, cc)
+}
+
+func waitWriters(t *testing.T, parent context.Context, writer *managed.Pool, db *sql.DB, stmt *sql.Stmt, previous, description string, transitionStart ...time.Time) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
+	started := time.Now()
+	if len(transitionStart) != 0 {
+		started = transitionStart[0]
+	}
+	budget := 3 * time.Minute
+	if configured := os.Getenv("CNPGCONNECT_GO_E2E_RECOVERY_SLO"); configured != "" {
+		var err error
+		budget, err = time.ParseDuration(configured)
+		if err != nil || budget <= 0 {
+			t.Fatal("CNPGCONNECT_GO_E2E_RECOVERY_SLO must be a positive duration")
+		}
+	}
+	ctx, cancel := context.WithDeadline(parent, started.Add(budget))
 	defer cancel()
 	var last error
+	probes, failures := 0, 0
 	for {
+		probes++
 		probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
 		var pgxAddress, sqlAddress, preparedAddress string
 		var pgxRecovery, sqlRecovery, preparedRecovery bool
@@ -191,8 +239,11 @@ func waitWriters(t *testing.T, parent context.Context, writer *managed.Pool, db 
 		}
 		probeCancel()
 		if err == nil && !pgxRecovery && !sqlRecovery && !preparedRecovery && pgxAddress != previous && pgxAddress != "" && pgxAddress == sqlAddress && pgxAddress == preparedAddress {
+			sample, _ := json.Marshal(map[string]any{"phase": description, "seconds": time.Since(started).Seconds(), "probes": probes, "failed_probes": failures})
+			t.Logf("CNPG_RECOVERY_SAMPLE %s", sample)
 			return pgxAddress
 		}
+		failures++
 		last = err
 		if err == nil {
 			last = fmt.Errorf("addresses pgx=%s sql=%s prepared=%s; recovery=%v/%v/%v", pgxAddress, sqlAddress, preparedAddress, pgxRecovery, sqlRecovery, preparedRecovery)

@@ -149,10 +149,11 @@ func TestLiveDiscoveryOutage(t *testing.T) {
 		}
 	}
 	t.Log("pgx, SQL, and prepared SQL rejected expired routes while PostgreSQL remained healthy")
+	recoveryStarted := time.Now()
 	if err := h.scaleDiscovery(ctx, deployment.Metadata.UID, deployment.Spec.Replicas); err != nil {
 		t.Fatal(err)
 	}
-	after := waitWriters(t, ctx, writer, db, stmt, "", "discovery restart")
+	after := waitWriters(t, ctx, writer, db, stmt, "", "discovery restart", recoveryStarted)
 	if before != after {
 		t.Fatalf("discovery restart changed the PostgreSQL server: before=%s after=%s", before, after)
 	}

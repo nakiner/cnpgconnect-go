@@ -30,9 +30,7 @@ func TestPoliciesIdentityAndFreshness(t *testing.T) {
 	c := testClient()
 	now := time.Now()
 	s := snapshot(now)
-	if err := c.accept(s, now); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, now)
 	for _, tt := range []struct {
 		p    Policy
 		want string
@@ -49,9 +47,7 @@ func TestPoliciesIdentityAndFreshness(t *testing.T) {
 	refreshed := proto.Clone(s).(*connectv1.Snapshot)
 	refreshed.ObservedAt = timestamppb.New(now.Add(time.Second))
 	refreshed.ValidUntil = timestamppb.New(now.Add(16 * time.Second))
-	if err := c.accept(refreshed, now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, refreshed, now.Add(time.Second))
 	if !c.Valid(Policy{}, target) {
 		t.Fatal("heartbeat invalidated existing connection")
 	}
@@ -67,18 +63,14 @@ func TestPoliciesIdentityAndFreshness(t *testing.T) {
 		t.Fatal("expired connection remained eligible")
 	}
 	fresh := snapshot(now.Add(2 * time.Second))
-	if err := c.accept(fresh, now.Add(2*time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, fresh, now.Add(2*time.Second))
 	if c.Valid(Policy{}, target) {
 		t.Fatal("expiry/recovery reused old connection generation")
 	}
 	newTarget, _ := c.Resolve(context.Background(), Policy{})
 	fresh.Members[0].Id = "p1-replacement"
 	fresh.PrimaryId = "p1-replacement"
-	if err := c.accept(fresh, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, fresh, time.Now())
 	if c.Valid(Policy{}, newTarget) {
 		t.Fatal("same-address Pod replacement was ignored")
 	}
@@ -91,9 +83,7 @@ func TestLaggingDiscoveryReplicaCannotRollBackRouting(t *testing.T) {
 	newer := snapshot(now.Add(time.Second))
 	newer.Members[0].Id = "new-primary"
 	newer.PrimaryId = "new-primary"
-	if err := c.accept(newer, now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, newer, now.Add(time.Second))
 	target, _ := c.Resolve(context.Background(), Policy{})
 	if err := c.accept(older, now.Add(time.Second)); !errors.Is(err, errOutOfOrder) {
 		t.Fatalf("accepted old observation: %v", err)
@@ -103,9 +93,7 @@ func TestLaggingDiscoveryReplicaCannotRollBackRouting(t *testing.T) {
 	}
 	oldUntil := c.Status().ValidUntil
 	newer.ValidUntil = timestamppb.New(now.Add(time.Minute))
-	if err := c.accept(newer, now.Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, newer, now.Add(time.Second))
 	if !c.Status().ValidUntil.Equal(oldUntil) {
 		t.Fatal("replayed observation extended freshness")
 	}
@@ -114,14 +102,10 @@ func TestLaggingDiscoveryReplicaCannotRollBackRouting(t *testing.T) {
 func TestUnrelatedReplicaChangePreservesPrimaryConnection(t *testing.T) {
 	c := testClient()
 	s := snapshot(time.Now())
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	primary, _ := c.Resolve(context.Background(), Policy{})
 	s.Members[1].SyncState = connectv1.SyncState_SYNC_STATE_POTENTIAL
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	if !c.Valid(Policy{}, primary) {
 		t.Fatal("unrelated replica update invalidated healthy primary")
 	}
@@ -131,9 +115,7 @@ func TestConnectionMetadataChangesInvalidateExistingConnections(t *testing.T) {
 	c := testClient()
 	s := snapshot(time.Now())
 	s.Connection = &connectv1.ConnectionParameters{Database: "rent", ServerCaPem: []byte("first CA")}
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	updates, stop := c.Subscribe()
 	defer stop()
 	<-updates
@@ -141,14 +123,9 @@ func TestConnectionMetadataChangesInvalidateExistingConnections(t *testing.T) {
 		func() { s.Connection.Database = "rent_data" },
 		func() { s.Connection.ServerCaPem = []byte("rotated CA") },
 	} {
-		previous, err := c.Resolve(context.Background(), Policy{})
-		if err != nil {
-			t.Fatal(err)
-		}
+		previous := resolveTarget(t, c, Policy{})
 		mutate()
-		if err := c.accept(s, time.Now()); err != nil {
-			t.Fatal(err)
-		}
+		acceptSnapshot(t, c, s, time.Now())
 		if c.Valid(Policy{}, previous) {
 			t.Fatal("connection survived changed database/CA metadata")
 		}
@@ -169,24 +146,18 @@ func TestAutomaticNetworkTargetsAndEndpointChanges(t *testing.T) {
 	c.cfg.Network = ""
 	s := snapshot(time.Now())
 	s.Members[0].Endpoints["external"] = &connectv1.Endpoint{Host: "primary.example.com", Port: 6432, ServerName: "app.test"}
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	target, err := c.Resolve(context.Background(), Policy{})
 	if err != nil || target.Endpoint.Host != "p1.test" || target.FallbackEndpoint.Host != "primary.example.com" {
 		t.Fatalf("automatic target = %+v, %v", target, err)
 	}
 	s.Members[0].Endpoints["external"].Host = "new-primary.example.com"
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	if c.Valid(Policy{}, target) {
 		t.Fatal("changed external endpoint did not invalidate previous target")
 	}
 	delete(s.Members[0].Endpoints, "internal")
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	target, err = c.Resolve(context.Background(), Policy{})
 	if err != nil || target.Endpoint.Host != "new-primary.example.com" || target.FallbackEndpoint.Host != "" {
 		t.Fatalf("external-only target = %+v, %v", target, err)
@@ -196,9 +167,7 @@ func TestAutomaticNetworkTargetsAndEndpointChanges(t *testing.T) {
 func TestUnavailablePolicyWaitsAndRecovers(t *testing.T) {
 	c := testClient()
 	s := snapshot(time.Now())
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if _, err := c.Resolve(ctx, Policy{Role: PotentialReplica}); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrUnavailable) {
@@ -209,9 +178,7 @@ func TestUnavailablePolicyWaitsAndRecovers(t *testing.T) {
 	result := make(chan Target, 1)
 	go func() { target, _ := c.Resolve(ctx2, Policy{Role: PotentialReplica}); result <- target }()
 	s.Members[1].SyncState = connectv1.SyncState_SYNC_STATE_POTENTIAL
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	if got := <-result; got.MemberID != "s1" {
 		t.Fatalf("did not recover: %+v", got)
 	}
@@ -230,9 +197,7 @@ func TestMalformedSnapshotsAndNetworks(t *testing.T) {
 	}
 	c := testClient()
 	c.cfg.Network = "external"
-	if err := c.accept(snapshot(time.Now()), time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, snapshot(time.Now()), time.Now())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	if _, err := c.Resolve(ctx, Policy{}); !errors.Is(err, ErrUnavailable) {
@@ -244,9 +209,7 @@ func TestPolicyFallbackAndStatusAreDefensive(t *testing.T) {
 	c := testClient()
 	s := snapshot(time.Now())
 	s.Members[1].Ready = false
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	acceptSnapshot(t, c, s, time.Now())
 	p := Policy{Role: SyncReplica, Fallback: []Role{Primary}}
 	fallback, _ := c.Resolve(context.Background(), p)
 	status := c.Status()
@@ -255,9 +218,8 @@ func TestPolicyFallbackAndStatusAreDefensive(t *testing.T) {
 		t.Fatal("mutating status changed routing")
 	}
 	s.Members[1].Ready = true
-	if err := c.accept(s, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	s.ObservedAt = timestamppb.New(s.ObservedAt.AsTime().Add(time.Second))
+	acceptSnapshot(t, c, s, time.Now())
 	if c.Valid(p, fallback) {
 		t.Fatal("fallback persisted after preferred role recovered")
 	}

@@ -42,9 +42,11 @@ the discovery plugin.
 The discovery endpoint uses a certificate trusted by the operating system. Your
 platform installs that endpoint once; applications use its address. PostgreSQL
 member addresses must be reachable from the application network.
-The library tries each member's internal address first and its advertised
-external address if needed. Applications inside and outside Kubernetes use the
-same five settings; the platform configures per-member external addresses once.
+The library initially tries each member's internal address first and its advertised
+external address if needed. A verified successful external path is preferred for
+one minute within that pool and target generation; it then retries the internal
+path. Applications inside and outside Kubernetes use the same five settings;
+the platform configures per-member external addresses once.
 
 For `database/sql`, use the same configuration with `stdlib.Open`:
 
@@ -74,7 +76,7 @@ libraries accepting `*sql.DB` work the same way.
 | `cnpgconnect-go/stdlib` | `*sql.DB` |
 | `cnpgconnect-go` | Discovery `Client` and reusable `Resolver` interface |
 
-The Go package name is `cnpgconnectgo`. Go 1.26.4 or later is required.
+The Go package name is `cnpgconnectgo`. Go 1.27.1 or later is required.
 See the [runnable examples](examples/README.md).
 
 ## Routing and pool options
@@ -114,3 +116,23 @@ applications through these API bindings.
 
 Earlier live tests covered CNPG 1.30 switchover, primary Pod loss, and discovery
 outage/recovery; see the historical [validation record](docs/validation.md).
+The [current hardening contract and isolated qualification gate](docs/hardening.md)
+cover withdrawal ordering, telemetry, repeated recovery, and stalled streams.
+
+The code has three responsibilities: `Client` receives discovery updates,
+the routing code selects eligible members, and `pgxpool` connects those members
+using native pgx hooks. `stdlib` adapts that same pool for database/sql and Bun.
+The pool entry point is in `pgxpool/pool.go`; constructor/TLS configuration and
+acquisition hooks live in `connection_config.go` and `pool_hooks.go` respectively.
+pgx owns the PostgreSQL protocol and pooling; gRPC owns discovery transport.
+Connection identity lives in pgx's connection metadata. Native pgx `Reset`
+handles retirement when an established route becomes ineligible, while held
+transactions continue until released. A multi-member pool can reconnect its
+other sessions after such a change; routine freshness updates cause no reset.
+
+Tests keep these boundaries visible: table-driven routing cases cover stale
+observations and role changes, socket tests cover connection and TLS failures,
+and the isolated CNPG suite checks real promotion and recovery through unchanged
+application handles. Timing and cancellation regressions stay local because a
+cluster lifecycle test cannot reliably force every scheduling race. Development
+uses Go and the plugin's shell runner; no Python environment is required.

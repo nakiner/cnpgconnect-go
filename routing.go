@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
-	"reflect"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,13 +27,21 @@ func (c *Client) Resolve(ctx context.Context, p Policy) (Target, error) {
 			c.mu.Unlock()
 			return Target{}, ErrClosed
 		}
-		members := c.candidatesLocked(p)
-		if len(members) > 0 {
+		role, local, count := c.selectionLocked(p)
+		if count > 0 {
 			// Independent random selection avoids coupling different policies'
 			// traffic through one shared round-robin counter.
-			target := members[rand.IntN(len(members))]
-			c.mu.Unlock()
-			return target, nil
+			index := rand.IntN(count)
+			for _, target := range c.state.Members {
+				if !matches(role, target) || (local && target.Zone != p.PreferZone) {
+					continue
+				}
+				if index == 0 {
+					c.mu.Unlock()
+					return target, nil
+				}
+				index--
+			}
 		}
 		ch := c.changed
 		c.mu.Unlock()
@@ -56,7 +63,11 @@ func (c *Client) Valid(p Policy, target Target) bool {
 	if c.closed {
 		return false
 	}
-	for _, m := range c.candidatesLocked(p) {
+	role, local, count := c.selectionLocked(p)
+	if count == 0 || !matches(role, target) || (local && target.Zone != p.PreferZone) {
+		return false
+	}
+	for _, m := range c.state.Members {
 		if m == target {
 			return true
 		}
@@ -64,34 +75,35 @@ func (c *Client) Valid(p Policy, target Target) bool {
 	return false
 }
 
-func (c *Client) candidatesLocked(p Policy) []Target {
+// selectionLocked identifies the winning role/zone without materializing a
+// candidate slice. Both selection and eligibility use exactly the same policy.
+func (c *Client) selectionLocked(p Policy) (role Role, local bool, count int) {
 	if !c.state.Ready {
-		return nil
+		return
 	}
-	for _, role := range append([]Role{p.Role}, p.Fallback...) {
-		var members []Target
+	for i := -1; i < len(p.Fallback); i++ {
+		role = p.Role
+		if i >= 0 {
+			role = p.Fallback[i]
+		}
+		zoneCount := 0
 		for _, m := range c.state.Members {
 			if matches(role, m) {
-				members = append(members, m)
-			}
-		}
-		if len(members) == 0 {
-			continue
-		}
-		if p.PreferZone != "" {
-			var local []Target
-			for _, m := range members {
-				if m.Zone == p.PreferZone {
-					local = append(local, m)
+				count++
+				if p.PreferZone != "" && m.Zone == p.PreferZone {
+					zoneCount++
 				}
 			}
-			if len(local) > 0 {
-				return local
-			}
 		}
-		return members
+		if count == 0 {
+			continue
+		}
+		if zoneCount > 0 {
+			return role, true, zoneCount
+		}
+		return role, false, count
 	}
-	return nil
+	return
 }
 
 func matches(role Role, m Target) bool {
@@ -115,7 +127,14 @@ func matches(role Role, m Target) bool {
 	}
 }
 
-func (c *Client) accept(s *connectv1.Snapshot, now time.Time) error {
+func (c *Client) accept(s *connectv1.Snapshot, now time.Time) (acceptErr error) {
+	defer func() {
+		if acceptErr != nil {
+			c.counters.rejected.Add(1)
+		} else {
+			c.counters.accepted.Add(1)
+		}
+	}()
 	members, until, err := c.validateSnapshot(s, now)
 	if err != nil {
 		return err
@@ -125,22 +144,65 @@ func (c *Client) accept(s *connectv1.Snapshot, now time.Time) error {
 	if c.closed {
 		return ErrClosed
 	}
-	if s.ObservedAt.AsTime().Before(c.state.ObservedAt) {
+	at := s.ObservedAt.AsTime()
+	withdrawal := !s.Available || s.Transitioning
+	// Negative evidence for the current incarnation is authoritative even from
+	// a lagging observer. Keep the positive-observation high-water mark: an old
+	// or equal positive replay must not resurrect a withdrawn route.
+	if at.Before(c.state.ObservedAt) {
+		if s.Cluster.Uid != c.clusterUID {
+			return errOutOfOrder
+		}
+		if !withdrawal {
+			return c.acceptOlderWithdrawalsLocked(s, members, now)
+		}
+	}
+	if !withdrawal && c.withdrawn && !at.After(c.state.ObservedAt) {
 		return errOutOfOrder
 	}
-	if s.ObservedAt.AsTime().Equal(c.state.ObservedAt) {
+	if at.Equal(c.state.ObservedAt) && s.Cluster.Uid == c.clusterUID {
+		// Remember withdrawals of previously eligible identities. Metadata
+		// changes for an eligible member still invalidate its old generation,
+		// but cannot undo a readiness/removal withdrawal within this sample.
+		for _, previous := range c.state.Members {
+			present := false
+			for _, member := range members {
+				if previous.MemberID == member.MemberID {
+					present = true
+					break
+				}
+			}
+			if !present {
+				delete(c.observationMembers, previous.MemberID)
+			}
+		}
+		retained := members[:0]
+		for _, member := range members {
+			if _, allowed := c.observationMembers[member.MemberID]; allowed {
+				retained = append(retained, member)
+			}
+		}
+		members = retained
+	} else if at.After(c.state.ObservedAt) || s.Cluster.Uid != c.clusterUID {
+		// Bound retained identities to one complete observation. New identities
+		// and recovery of withdrawn members require a newer positive sample.
+		// Seed only validated eligible members: withdrawal may be the first
+		// evidence received for an identity in this observation epoch.
+		c.observationMembers = make(map[string]struct{}, len(members))
+		for _, member := range members {
+			c.observationMembers[member.MemberID] = struct{}{}
+		}
+	}
+	if !at.After(c.state.ObservedAt) {
 		// A replayed observation cannot extend its original freshness lifetime.
 		until = minTime(until, c.state.ValidUntil)
+		at = c.state.ObservedAt
 	}
 	c.expireLocked(now)
 	ready := s.Available && !s.Transitioning && now.Before(until)
 	// Identity/generation belongs to this process, never to an opaque server
 	// revision. Full snapshots after reconnect can legitimately rewind revision.
-	old := append([]Target(nil), c.state.Members...)
-	for i := range old {
-		old[i].Generation = 0
-	}
-	changed := ready != c.state.Ready || !reflect.DeepEqual(old, members)
+	changed := ready != c.state.Ready || !slices.EqualFunc(c.state.Members, members, sameMember)
 	wasReady := c.state.Ready
 	if changed {
 		c.generation++
@@ -150,11 +212,9 @@ func (c *Client) accept(s *connectv1.Snapshot, now time.Time) error {
 		// An unrelated replica update need not reconnect a healthy primary.
 		// Expiry/unavailability, however, invalidates every previous generation.
 		if wasReady && ready {
-			for j, previous := range old {
-				candidate := members[i]
-				candidate.Generation = 0
-				if candidate == previous {
-					members[i].Generation = c.state.Members[j].Generation
+			for _, previous := range c.state.Members {
+				if sameMember(members[i], previous) {
+					members[i].Generation = previous.Generation
 					break
 				}
 			}
@@ -163,7 +223,9 @@ func (c *Client) accept(s *connectv1.Snapshot, now time.Time) error {
 	c.state.Ready = ready
 	c.state.Connected = true
 	c.state.Revision = s.Revision
-	c.state.ObservedAt = s.ObservedAt.AsTime()
+	c.state.ObservedAt = at
+	c.clusterUID = s.Cluster.Uid
+	c.withdrawn = withdrawal
 	c.state.ValidUntil = until
 	c.state.Members = members
 	c.state.LastError = nil
@@ -175,6 +237,53 @@ func (c *Client) accept(s *connectv1.Snapshot, now time.Time) error {
 	} else {
 		c.signalWaitersLocked()
 	}
+	return nil
+}
+
+// A lagging observer can learn that a member is no longer eligible after its
+// last complete observation. Preserve this negative evidence without accepting
+// any of the older snapshot's positive routing data or freshness. An absent
+// member alone is not evidence: the older observation may predate its creation.
+func (c *Client) acceptOlderWithdrawalsLocked(s *connectv1.Snapshot, eligible []Target, now time.Time) error {
+	eligibleIDs := make(map[string]struct{}, len(eligible))
+	for _, member := range eligible {
+		eligibleIDs[member.MemberID] = struct{}{}
+	}
+	withdrawnIDs := make(map[string]struct{})
+	for _, member := range s.Members {
+		if _, ok := eligibleIDs[member.Id]; !ok {
+			withdrawnIDs[member.Id] = struct{}{}
+		}
+	}
+
+	retained := make([]Target, 0, len(c.state.Members))
+	primaryWithdrawn := false
+	for _, member := range c.state.Members {
+		if _, withdrawn := withdrawnIDs[member.MemberID]; withdrawn {
+			delete(c.observationMembers, member.MemberID)
+			primaryWithdrawn = primaryWithdrawn || member.Role == Primary
+			continue
+		}
+		retained = append(retained, member)
+	}
+	if len(retained) == len(c.state.Members) {
+		return errOutOfOrder
+	}
+
+	c.expireLocked(now)
+	c.state.Members = retained
+	c.state.Connected = true
+	c.state.Revision = s.Revision
+	c.generation++
+	if primaryWithdrawn {
+		c.state.Ready = false
+		c.withdrawn = true
+	}
+	c.state.LastError = nil
+	if !c.state.Ready {
+		c.state.LastError = ErrUnavailable
+	}
+	c.signalLocked()
 	return nil
 }
 
@@ -274,8 +383,14 @@ func (c *Client) validateSnapshot(s *connectv1.Snapshot, now time.Time) ([]Targe
 	if !s.Available || s.Transitioning {
 		result = nil
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].MemberID < result[j].MemberID })
+	slices.SortFunc(result, func(a, b Target) int { return strings.Compare(a.MemberID, b.MemberID) })
 	return result, until, nil
+}
+
+// Discovery describes a member; the client assigns its local connection generation.
+func sameMember(a, b Target) bool {
+	a.Generation, b.Generation = 0, 0
+	return a == b
 }
 
 func minTime(a, b time.Time) time.Time {

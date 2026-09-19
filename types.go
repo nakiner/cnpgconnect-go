@@ -42,7 +42,11 @@ type Policy struct {
 }
 
 func (p Policy) Validate() error {
-	for _, role := range append([]Role{p.Role}, p.Fallback...) {
+	for i := -1; i < len(p.Fallback); i++ {
+		role := p.Role
+		if i >= 0 {
+			role = p.Fallback[i]
+		}
 		switch role {
 		case "", Primary, Replica, SyncReplica, AsyncReplica, QuorumReplica, PotentialReplica, Any:
 		default:

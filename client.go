@@ -22,18 +22,22 @@ var errOutOfOrder = errors.New("cnpgconnect-go: older observation ignored")
 // Client owns one reconnecting discovery stream and a shared routing view.
 // The constructor context controls startup only; Close stops the client.
 type Client struct {
-	cfg         Config
-	conn        *grpc.ClientConn
-	topology    connectv1.TopologyServiceClient
-	ctx         context.Context
-	cancel      context.CancelFunc
-	done        chan struct{}
-	mu          sync.Mutex
-	state       Status
-	closed      bool
-	generation  uint64
-	changed     chan struct{}
-	subscribers map[chan struct{}]struct{}
+	counters           clientCounters
+	cfg                Config
+	conn               *grpc.ClientConn
+	topology           connectv1.TopologyServiceClient
+	ctx                context.Context
+	cancel             context.CancelFunc
+	done               chan struct{}
+	mu                 sync.Mutex
+	state              Status
+	clusterUID         string
+	withdrawn          bool
+	observationMembers map[string]struct{}
+	closed             bool
+	generation         uint64
+	changed            chan struct{}
+	subscribers        map[chan struct{}]struct{}
 }
 
 // New waits for the first fresh available topology. Credentials and discovery
@@ -54,7 +58,16 @@ func New(ctx context.Context, config Config) (*Client, error) {
 		return nil, fmt.Errorf("cnpgconnect-go: discovery client: %w", err)
 	}
 	life, cancel := context.WithCancel(context.Background())
-	c := &Client{cfg: cfg, conn: conn, topology: connectv1.NewTopologyServiceClient(conn), ctx: life, cancel: cancel, done: make(chan struct{}), changed: make(chan struct{}), subscribers: map[chan struct{}]struct{}{}}
+	c := &Client{
+		cfg:         cfg,
+		conn:        conn,
+		topology:    connectv1.NewTopologyServiceClient(conn),
+		ctx:         life,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		changed:     make(chan struct{}),
+		subscribers: make(map[chan struct{}]struct{}),
+	}
 	go c.run()
 	startup, stop := context.WithTimeout(ctx, cfg.StartupTimeout)
 	defer stop()
@@ -122,8 +135,7 @@ func (c *Client) Subscribe() (<-chan struct{}, func()) {
 }
 
 func (c *Client) signalLocked() {
-	close(c.changed)
-	c.changed = make(chan struct{})
+	c.signalWaitersLocked()
 	for ch := range c.subscribers {
 		select {
 		case ch <- struct{}{}:
@@ -158,11 +170,7 @@ func (c *Client) waitReady(ctx context.Context) error {
 func (c *Client) run() {
 	defer close(c.done)
 	var expiry sync.WaitGroup
-	expiry.Add(1)
-	go func() {
-		defer expiry.Done()
-		c.runExpiry()
-	}()
+	expiry.Go(c.runExpiry)
 	defer expiry.Wait()
 	delay := c.cfg.ReconnectMin
 	for c.ctx.Err() == nil {
@@ -232,9 +240,13 @@ func (c *Client) runExpiry() {
 }
 
 func (c *Client) watch() (bool, error) {
+	c.counters.watchAttempts.Add(1)
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
-	watchdog := time.AfterFunc(c.cfg.MaxSnapshotTTL, cancel)
+	watchdog := time.AfterFunc(c.watchTimeout(), func() {
+		c.counters.watchTimeouts.Add(1)
+		cancel()
+	})
 	defer watchdog.Stop()
 	if c.cfg.Token != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.cfg.Token)
@@ -260,13 +272,29 @@ func (c *Client) watch() (bool, error) {
 			return got, err
 		}
 		got = true
-		watchdog.Reset(c.cfg.MaxSnapshotTTL)
+		watchdog.Reset(c.watchTimeout())
 	}
+}
+
+// Bound each watch by usable cached routing, even before its first response.
+// Unavailable or already expired views use the idle timeout to avoid turning an
+// unhealthy cluster into a tight reconnect loop. The accepted deadline includes
+// replay and TTL caps, so wire timestamps cannot extend it here.
+func (c *Client) watchTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if remaining := time.Until(c.state.ValidUntil); c.state.Ready && remaining > 0 {
+		return min(c.cfg.MaxSnapshotTTL, remaining)
+	}
+	return c.cfg.MaxSnapshotTTL
 }
 
 // Wake startup/routing waiters without resetting healthy pools for transport
 // changes. A valid observation may remain usable until its original expiry.
-func (c *Client) signalWaitersLocked() { close(c.changed); c.changed = make(chan struct{}) }
+func (c *Client) signalWaitersLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
 
 func (c *Client) invalidateLocked() {
 	if c.state.Ready {
@@ -277,6 +305,9 @@ func (c *Client) invalidateLocked() {
 }
 func (c *Client) expireLocked(now time.Time) {
 	if !now.Before(c.state.ValidUntil) {
+		if c.state.Ready {
+			c.counters.expirations.Add(1)
+		}
 		c.invalidateLocked()
 	}
 }

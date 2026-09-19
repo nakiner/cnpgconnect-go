@@ -138,19 +138,14 @@ func TestExpiryUsesUpdatedSnapshotDeadline(t *testing.T) {
 				acceptFor := func(ttl time.Duration) {
 					s := snapshot(time.Now())
 					s.ValidUntil = timestamppb.New(time.Now().Add(ttl))
-					if err := c.accept(s, time.Now()); err != nil {
-						t.Fatal(err)
-					}
+					acceptSnapshot(t, c, s, time.Now())
 					synctest.Wait()
 				}
 				acceptFor(tc.initialTTL)
 				updates, unsubscribe := c.Subscribe()
 				defer unsubscribe()
 				<-updates
-				target, err := c.Resolve(context.Background(), Policy{})
-				if err != nil {
-					t.Fatal(err)
-				}
+				target := resolveTarget(t, c, Policy{})
 				time.Sleep(250 * time.Millisecond)
 				acceptFor(tc.updatedTTL)
 				if !c.Valid(Policy{}, target) {

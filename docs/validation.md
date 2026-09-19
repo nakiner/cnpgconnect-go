@@ -1,5 +1,58 @@
 # Validation record
 
+## Sustained pool recovery — 2026-09-19
+
+The paired plugin/library runner passed nine selected suites without skips or
+failures against Kubernetes 1.34.0, unmodified CNPG 1.30.0 and PostgreSQL 18.4,
+with two plugin replicas and three database instances. The source was held
+unchanged and verified by hash. The owned kind cluster was removed afterward;
+no production cluster was modified.
+
+The new soak warmed 32 persistent pools (16 pgx and 16 `database/sql`) to
+64 connections, then ran 64 query workers through five promotion/discovery-outage
+cycles in 3m11s. Every worker recovered using its original pool handle: promotion
+recovery took 3.151–5.127 seconds, and discovery restoration took 8.637–11.878
+seconds including Pod startup. Each outage verified deadline failures after
+topology expiry while a direct PostgreSQL connection remained usable.
+
+There were 68,939 successful primary queries out of 70,140 attempts, with 1,201
+errors during fault injection and no observed standby results. Successful-query
+p95 had a 16.384 ms histogram upper bound; all-attempt p99 was bounded by the
+4,194.304 ms bucket, including outage timeouts. The sampled connection peak on
+the current primary was 64, and closing the pools left none there. Sampling
+does not establish a simultaneous cluster-wide connection maximum. pgx may
+refill connections gradually after resets.
+
+Existing suites also passed prepared-statement reuse, primary Pod deletion,
+open-socket discovery stalls, and certificate rotation. The new test is opt-in
+for local/manual runs and enabled in weekly CI; see the
+[integration guide](../test/integration/README.md). These short local runs do
+not establish sustained fleet capacity or external-network behavior. Queries
+and transactions are never replayed. The public API and library runtime are
+unchanged by this qualification work.
+
+## pgx connection ownership and retirement — 2026-09-19
+
+The adapter now stores immutable connection identity in pgx CustomData and uses
+native Pool.Reset when an established route becomes ineligible. `make check`
+passed, including the full race suite, vet, examples and integration compilation;
+the pgxpool/stdlib packages also passed five race repetitions. Tests verify
+borrowed-session survival, callback behavior, constructor cancellation and
+bounded route history. Configuration and public signatures are unchanged.
+
+The matching plugin/client pair then passed eight isolated suites with no
+failures or skips against Kubernetes 1.34.0, CNPG 1.30.0 and PostgreSQL 18.4,
+using Go 1.27.1. Three lifecycle repetitions retained the same pgx, database/sql
+and prepared-statement handles through planned promotion and primary Pod loss.
+Discovery outage and open-socket stall recovery passed. The plugin's CA Secret
+update and certificate renewal checks passed, and the disposable cluster was
+removed. No production environment was modified.
+
+Whole-pool retirement can reconnect healthy sessions in a multi-member pool;
+held connections remain usable until release. Freshness heartbeats do not reset
+the pool. These smoke tests do not establish a production capacity or latency
+guarantee. The paired plugin's performance guide records recovery measurements.
+
 ## Unreleased reconnect and expiry improvements — 2026-09-18
 
 Current source after `v0.0.5` passed `make check`, including race tests, vet,

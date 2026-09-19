@@ -19,3 +19,12 @@ jobs:
             go.sum
             examples/*/go.sum
       - run: make check
+      - name: Scan source and built test executables
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
+          mkdir -p work/vuln-binaries
+          go test -c -o work/vuln-binaries/ ./...
+          for binary in work/vuln-binaries/*; do
+            govulncheck -mode=binary "$binary"
+          done

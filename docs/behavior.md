@@ -13,10 +13,11 @@ Applications keep calling the same pgx pool or SQL DB throughout that process.
    fails; it does not change member or routing role to choose a reachable path.
 3. Every acquisition checks whether the connection still matches the current,
    unexpired routing policy. An obsolete connection is retired before use.
-4. Role changes and expiry wake pool maintenance. Connection attempts to an
+4. Role changes and expiry wake the pool. Connection attempts to an
    obsolete member are canceled during startup, freeing their pool slots
-   without waiting for the connection timeout. Borrowed connections retire
-   when released if their identity is no longer eligible.
+   without waiting for the connection timeout. If a route used by the pool
+   becomes ineligible, native pgx `Reset` retires idle connections and closes
+   borrowed connections when they are released.
 5. If the discovery stream closes, the client reconnects with bounded, jittered backoff.
    The last snapshot remains usable only until its validity deadline.
 
@@ -34,7 +35,9 @@ There is no Kubernetes watch or Kubernetes authentication in application code.
 When a policy has several eligible members, each new connection chooses one
 uniformly at random. Reusing a healthy connection does not rebalance every query.
 An unrelated replica update also does not retire a still-eligible primary
-connection.
+connection. A pool using several members resets as a whole when one of its
+routes becomes ineligible, so its other sessions may also reconnect on release.
+Freshness-only updates never reset the pool.
 
 ## During an outage
 

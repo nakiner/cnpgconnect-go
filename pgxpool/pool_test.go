@@ -56,12 +56,11 @@ func TestSwitchRetiresIdleAndPreservesBorrowedConnection(t *testing.T) {
 	}
 	old := borrowed.Conn().PgConn()
 	borrowed.Release()
-	waitFor(t, func() bool {
-		pool.mu.RLock()
-		defer pool.mu.RUnlock()
-		_, exists := pool.targets[old]
-		return !exists
-	})
+	select {
+	case <-old.CleanupDone():
+	case <-time.After(time.Second):
+		t.Fatal("obsolete connection was not closed after release")
+	}
 	// Background retirement must leave the new member available.
 	if err := pool.QueryRow(ctx, "SELECT identity").Scan(&identity); err != nil || identity != "b" {
 		t.Fatalf("after release = %q, %v", identity, err)
@@ -275,15 +274,16 @@ func TestEndpointOverridesAndTLSIsolation(t *testing.T) {
 	}
 }
 
-func TestAfterConnectErrorDoesNotRetainIdentity(t *testing.T) {
+func TestAfterConnectErrorClosesConnection(t *testing.T) {
 	server := newPostgres(t, "a", false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := &Pool{resolver: newResolver(server.target(1)), ctx: ctx, targets: make(map[*pgconn.PgConn]cnpgconnectgo.Target)}
+	p := &Pool{resolver: newResolver(server.target(1)), ctx: ctx, routes: make(map[cnpgconnectgo.Target]struct{})}
 	cfg := testConfig(t)
 	cfg.ConnConfig.ConnectTimeout = time.Second
 	errHook := errors.New("application initialization failed")
-	cfg.AfterConnect = func(context.Context, *pgx.Conn) error { return errHook }
+	var rejected *pgx.Conn
+	cfg.AfterConnect = func(_ context.Context, conn *pgx.Conn) error { rejected = conn; return errHook }
 	p.installHooks(cfg)
 	var err error
 	p.Pool, err = native.NewWithConfig(ctx, cfg)
@@ -294,34 +294,39 @@ func TestAfterConnectErrorDoesNotRetainIdentity(t *testing.T) {
 	if err := p.Ping(ctx); !errors.Is(err, errHook) {
 		t.Fatalf("Ping error = %v", err)
 	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if len(p.targets) != 0 {
-		t.Fatal("failed AfterConnect retained connection identity")
+	if rejected == nil || !rejected.IsClosed() || p.Valid(rejected) {
+		t.Fatal("failed AfterConnect left a usable connection")
 	}
 }
 
-func TestHijackedConnectionCleanup(t *testing.T) {
+func TestConnectionIdentityAndHijack(t *testing.T) {
 	server := newPostgres(t, "a", false)
 	pool, err := Open(context.Background(), Config{Resolver: newResolver(server.target(1)), ConnConfig: testConfig(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pool.Close()
+	other, err := Open(context.Background(), Config{Resolver: pool.resolver, ConnConfig: testConfig(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
 	conn, err := pool.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	hijacked := conn.Hijack()
+	// Connection-local identity survives Hijack, but cannot authenticate the
+	// connection as belonging to a different pool using the same resolver.
+	if !pool.Valid(hijacked) || other.Valid(hijacked) {
+		t.Fatal("connection identity did not preserve pool ownership")
+	}
 	if err := hijacked.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		pool.mu.RLock()
-		defer pool.mu.RUnlock()
-		_, exists := pool.targets[hijacked.PgConn()]
-		return !exists
-	})
+	if pool.Valid(hijacked) {
+		t.Fatal("closed connection remains eligible")
+	}
 }
 
 func TestHooksAndCallerConfigPreserved(t *testing.T) {
@@ -334,9 +339,22 @@ func TestHooksAndCallerConfigPreserved(t *testing.T) {
 		config.Host = "should-be-overridden.invalid"
 		return nil
 	}
-	cfg.ConnConfig.AfterConnect = func(context.Context, *pgconn.PgConn) error { pgAfter.Add(1); return nil }
-	cfg.AfterConnect = func(context.Context, *pgx.Conn) error { after.Add(1); return nil }
-	cfg.PrepareConn = func(context.Context, *pgx.Conn) (bool, error) { prepare.Add(1); return true, nil }
+	cfg.ConnConfig.AfterConnect = func(_ context.Context, conn *pgconn.PgConn) error {
+		conn.CustomData()["application"] = 42
+		pgAfter.Add(1)
+		return nil
+	}
+	cfg.AfterConnect = func(_ context.Context, conn *pgx.Conn) error {
+		if conn.PgConn().CustomData()["application"] != 42 {
+			t.Error("application connection metadata was overwritten")
+		}
+		after.Add(1)
+		return nil
+	}
+	cfg.PrepareConn = func(_ context.Context, conn *pgx.Conn) (bool, error) {
+		conn.PgConn().CustomData()["borrows"] = prepare.Add(1)
+		return true, nil
+	}
 	cfg.BeforeAcquire = func(context.Context, *pgx.Conn) bool {
 		t.Error("PrepareConn must supersede BeforeAcquire")
 		return false
@@ -396,6 +414,7 @@ func waitFor(t *testing.T, predicate func() bool) {
 type fakeResolver struct {
 	mu          sync.Mutex
 	target      cnpgconnectgo.Target
+	alsoValid   cnpgconnectgo.Target
 	changed     chan struct{}
 	subscribers map[chan struct{}]bool
 }
@@ -423,7 +442,7 @@ func (r *fakeResolver) Resolve(ctx context.Context, _ cnpgconnectgo.Policy) (cnp
 func (r *fakeResolver) Valid(_ cnpgconnectgo.Policy, target cnpgconnectgo.Target) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return target.MemberID != "" && target == r.target
+	return target.MemberID != "" && (target == r.target || target == r.alsoValid)
 }
 
 func (r *fakeResolver) Subscribe() (<-chan struct{}, func()) {

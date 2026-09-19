@@ -24,9 +24,7 @@ func TestEveryRoleTransitionInvalidatesOldConnection(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 				defer cancel()
 				now := time.Now()
-				if err := c.accept(transitionSnapshot(now, from), now); err != nil {
-					t.Fatal(err)
-				}
+				acceptSnapshot(t, c, transitionSnapshot(now, from), now)
 				original, err := c.Resolve(ctx, Policy{Role: from})
 				if err != nil || original.MemberID != "moving" {
 					t.Fatalf("initial target: %+v, %v", original, err)
@@ -35,9 +33,7 @@ func TestEveryRoleTransitionInvalidatesOldConnection(t *testing.T) {
 				defer stop()
 				<-changes
 				later := now.Add(time.Millisecond)
-				if err := c.accept(transitionSnapshot(later, to), later); err != nil {
-					t.Fatal(err)
-				}
+				acceptSnapshot(t, c, transitionSnapshot(later, to), later)
 				select {
 				case <-changes:
 				default:
@@ -54,9 +50,7 @@ func TestEveryRoleTransitionInvalidatesOldConnection(t *testing.T) {
 					t.Fatal("new role lacks a fresh eligible connection identity")
 				}
 				later = later.Add(time.Millisecond)
-				if err := c.accept(transitionSnapshot(later, from), later); err != nil {
-					t.Fatal(err)
-				}
+				acceptSnapshot(t, c, transitionSnapshot(later, from), later)
 				rejoined, err := c.Resolve(ctx, Policy{Role: from})
 				if err != nil || rejoined.MemberID != original.MemberID || !c.Valid(Policy{Role: from}, rejoined) {
 					t.Fatalf("return to original role failed: %+v, %v", rejoined, err)

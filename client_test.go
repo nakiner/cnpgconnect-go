@@ -183,10 +183,7 @@ func TestStalledStreamExpiresAndReconnects(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	target, err := c.Resolve(context.Background(), Policy{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	target := resolveTarget(t, c, Policy{})
 	time.Sleep(70 * time.Millisecond)
 	if c.Valid(Policy{}, target) {
 		t.Fatal("stalled stream renewed freshness")
