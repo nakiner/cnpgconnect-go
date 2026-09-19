@@ -20,50 +20,115 @@ import (
 )
 
 func TestStartupRetriesConnectionEOFAndPostgresStarting(t *testing.T) {
-	for _, mode := range []string{"socket_eof", "tls_eof", "postgres_starting"} {
-		t.Run(mode, func(t *testing.T) {
-			serverTLS, ca := testCertificate(t, "pg.test")
-			settings := postgresSettings{}
-			if mode == "tls_eof" {
-				settings.tls = serverTLS
-			}
-			healthy := newPostgres(t, "healthy", false, settings)
-			target := healthy.target(1)
-			cfg := testConfig(t)
-			cfg.MaxConns = 1
-			broken := failedStartupServer(t, mode)
-			dial := cfg.ConnConfig.DialFunc
-			var attempts atomic.Int32
-			cfg.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
-				if attempts.Add(1) == 1 {
-					address = broken
-				}
-				return dial(ctx, network, address)
-			}
-			config := Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second}
-			if mode == "tls_eof" {
-				target.Endpoint.ServerName = "pg.test"
-				target.Connection = cnpgconnectgo.ConnectionParameters{Database: "test", ServerCAPEM: string(ca)}
-				config.Resolver = newResolver(target)
-				config.Username = "test"
-			}
-			pool, err := Open(context.Background(), config)
-			if err != nil {
-				t.Fatalf("initial transient failure escaped startup: %v", err)
-			}
-			defer pool.Close()
-			// pgx may open a separate CancelRequest socket while cleaning up
-			// the failed connection. Count constructors, not control sockets.
-			if got := pool.Stat().NewConnsCount(); got != 2 {
-				t.Fatalf("connection constructors=%d, want one failure followed by success", got)
-			}
-			var identity string
-			if err := pool.QueryRow(context.Background(), "SELECT identity").Scan(&identity); err != nil || identity != healthy.identity {
-				t.Fatalf("Open returned an unusable pool: identity=%q error=%v", identity, err)
+	for _, path := range []string{"single_address", "missing_internal_dns"} {
+		t.Run(path, func(t *testing.T) {
+			for _, mode := range []string{"socket_eof", "tls_eof", "postgres_starting"} {
+				t.Run(mode, func(t *testing.T) {
+					serverTLS, ca := testCertificate(t, "pg.test")
+					settings := postgresSettings{}
+					if mode == "tls_eof" {
+						settings.tls = serverTLS
+					}
+					healthy := newPostgres(t, "healthy", false, settings)
+					target := healthy.target(1)
+					cfg := testConfig(t)
+					cfg.MaxConns = 1
+					broken := failedStartupServer(t, mode)
+					dial := cfg.ConnConfig.DialFunc
+					var attempts atomic.Int32
+					cfg.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+						if attempts.Add(1) == 1 {
+							address = broken
+						}
+						return dial(ctx, network, address)
+					}
+					config := Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second}
+					if mode == "tls_eof" {
+						target.Endpoint.ServerName = "pg.test"
+						target.Connection = cnpgconnectgo.ConnectionParameters{Database: "test", ServerCAPEM: string(ca)}
+						config.Resolver = newResolver(target)
+						config.Username = "test"
+					}
+					if path == "missing_internal_dns" {
+						target = missingInternalEndpoint(cfg.ConnConfig, target)
+						config.Resolver = newResolver(target)
+					}
+					pool, err := Open(context.Background(), config)
+					if err != nil {
+						t.Fatalf("initial transient failure escaped startup: %v", err)
+					}
+					defer pool.Close()
+					// pgx may open a separate CancelRequest socket while cleaning up
+					// the failed connection. Count constructors, not control sockets.
+					if got := pool.Stat().NewConnsCount(); got != 2 {
+						t.Fatalf("connection constructors=%d, want one failure followed by success", got)
+					}
+					var identity string
+					if err := pool.QueryRow(context.Background(), "SELECT identity").Scan(&identity); err != nil || identity != healthy.identity {
+						t.Fatalf("Open returned an unusable pool: identity=%q error=%v", identity, err)
+					}
+				})
 			}
 		})
 	}
 }
+
+func missingInternalEndpoint(cfg *pgx.ConnConfig, target cnpgconnectgo.Target) cnpgconnectgo.Target {
+	target.FallbackEndpoint = target.Endpoint
+	target.Endpoint.Host = "internal.invalid"
+	lookup := cfg.LookupFunc
+	cfg.LookupFunc = func(ctx context.Context, host string) ([]string, error) {
+		if host == target.Endpoint.Host {
+			return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+		}
+		return lookup(ctx, host)
+	}
+	return target
+}
+
+func TestStartupRetryClassificationWithOptionalDNS(t *testing.T) {
+	dns := &net.DNSError{Name: "internal.invalid", Err: "no such host", IsNotFound: true}
+	optionalDNS := &optionalLookupError{dns}
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"optional_dns_and_eof", errors.Join(optionalDNS, io.EOF), true},
+		{"required_dns_and_eof", errors.Join(dns, io.EOF), false},
+		{"only_optional_dns", errors.Join(optionalDNS, optionalDNS), false},
+		{"unknown_lookup_and_eof", errors.Join(&optionalLookupError{errors.New("invalid lookup configuration")}, io.EOF), false},
+		{"empty_join_and_eof", errors.Join(emptyStartupError{}, io.EOF), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := transientConnectError(test.err); got != test.want {
+				t.Fatalf("transientConnectError(%v)=%v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+	for name, hardStop := range map[string]error{
+		"authentication": &pgconn.PgError{Code: "28P01"},
+		"tls":            &tls.CertificateVerificationError{Err: io.EOF},
+		"hook":           &startupHookError{io.EOF},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Lookup callbacks can themselves return joined or nested errors.
+			// Finding DNS anywhere inside must not hide a hard-stop sibling.
+			joined := &optionalLookupError{errors.Join(dns, hardStop)}
+			nested := &optionalLookupError{&net.DNSError{IsNotFound: true, UnwrapErr: hardStop}}
+			for _, err := range []error{errors.Join(optionalDNS, hardStop), joined, nested} {
+				if transientConnectError(errors.Join(io.EOF, err)) {
+					t.Fatalf("hard stop was hidden by optional DNS: %v", err)
+				}
+			}
+		})
+	}
+}
+
+type emptyStartupError struct{}
+
+func (emptyStartupError) Error() string   { return "empty error group" }
+func (emptyStartupError) Unwrap() []error { return nil }
 
 func TestStartupRetryHonorsBudgetAndCancellation(t *testing.T) {
 	for _, mode := range []string{"startup_timeout", "caller_deadline", "caller_cancel"} {
@@ -122,84 +187,99 @@ func TestStartupDoesNotRetryApplicationHookErrors(t *testing.T) {
 	if connectionErr == nil {
 		t.Fatal("fixture did not return a connection error")
 	}
-	for _, hook := range []string{"before_connect", "after_net_connect", "validate_connect", "pgconn_after_connect", "after_connect", "prepare_conn", "oauth_token"} {
-		t.Run(hook, func(t *testing.T) {
-			server := newPostgres(t, "healthy", false)
-			cfg := testConfig(t)
-			cfg.MaxConns = 1
-			var calls atomic.Int32
-			fail := func() error { calls.Add(1); return connectionErr }
-			switch hook {
-			case "before_connect":
-				cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error { return fail() }
-			case "after_net_connect":
-				cfg.ConnConfig.AfterNetConnect = func(_ context.Context, _ *pgconn.Config, conn net.Conn) (net.Conn, error) { return conn, fail() }
-			case "validate_connect":
-				cfg.ConnConfig.ValidateConnect = func(context.Context, *pgconn.PgConn) error { return fail() }
-			case "pgconn_after_connect":
-				cfg.ConnConfig.AfterConnect = func(context.Context, *pgconn.PgConn) error { return fail() }
-			case "after_connect":
-				cfg.AfterConnect = func(context.Context, *pgx.Conn) error { return fail() }
-			case "prepare_conn":
-				cfg.PrepareConn = func(context.Context, *pgx.Conn) (bool, error) { return false, fail() }
-			case "oauth_token":
-				address := failedStartupServer(t, "oauth_token")
-				dial := cfg.ConnConfig.DialFunc
-				cfg.ConnConfig.DialFunc = func(ctx context.Context, network, _ string) (net.Conn, error) { return dial(ctx, network, address) }
-				cfg.ConnConfig.OAuthTokenProvider = func(context.Context) (string, error) { return "", fail() }
-			}
-			pool, err := Open(context.Background(), Config{Resolver: newResolver(server.target(1)), ConnConfig: cfg, StartupTimeout: time.Second})
-			if pool != nil || !errors.Is(err, connectionErr) || calls.Load() != 1 {
-				t.Fatalf("application hook was retried or lost its error: pool=%v calls=%d err=%v", pool, calls.Load(), err)
+	for _, path := range []string{"single_address", "missing_internal_dns"} {
+		t.Run(path, func(t *testing.T) {
+			for _, hook := range []string{"before_connect", "after_net_connect", "validate_connect", "pgconn_after_connect", "after_connect", "prepare_conn", "oauth_token"} {
+				t.Run(hook, func(t *testing.T) {
+					server := newPostgres(t, "healthy", false)
+					cfg := testConfig(t)
+					cfg.MaxConns = 1
+					var calls atomic.Int32
+					fail := func() error { calls.Add(1); return connectionErr }
+					switch hook {
+					case "before_connect":
+						cfg.BeforeConnect = func(context.Context, *pgx.ConnConfig) error { return fail() }
+					case "after_net_connect":
+						cfg.ConnConfig.AfterNetConnect = func(_ context.Context, _ *pgconn.Config, conn net.Conn) (net.Conn, error) { return conn, fail() }
+					case "validate_connect":
+						cfg.ConnConfig.ValidateConnect = func(context.Context, *pgconn.PgConn) error { return fail() }
+					case "pgconn_after_connect":
+						cfg.ConnConfig.AfterConnect = func(context.Context, *pgconn.PgConn) error { return fail() }
+					case "after_connect":
+						cfg.AfterConnect = func(context.Context, *pgx.Conn) error { return fail() }
+					case "prepare_conn":
+						cfg.PrepareConn = func(context.Context, *pgx.Conn) (bool, error) { return false, fail() }
+					case "oauth_token":
+						address := failedStartupServer(t, "oauth_token")
+						dial := cfg.ConnConfig.DialFunc
+						cfg.ConnConfig.DialFunc = func(ctx context.Context, network, _ string) (net.Conn, error) { return dial(ctx, network, address) }
+						cfg.ConnConfig.OAuthTokenProvider = func(context.Context) (string, error) { return "", fail() }
+					}
+					target := server.target(1)
+					if path == "missing_internal_dns" {
+						target = missingInternalEndpoint(cfg.ConnConfig, target)
+					}
+					pool, err := Open(context.Background(), Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second})
+					if pool != nil || !errors.Is(err, connectionErr) || calls.Load() != 1 {
+						t.Fatalf("application hook was retried or lost its error: pool=%v calls=%d err=%v", pool, calls.Load(), err)
+					}
+				})
 			}
 		})
 	}
 }
 
 func TestStartupDoesNotRetryAuthenticationOrTLSVerification(t *testing.T) {
-	for _, mode := range []string{"authentication", "wrong_server_name", "verify_peer", "verify_connection", "client_certificate"} {
-		t.Run(mode, func(t *testing.T) {
-			serverTLS, ca := testCertificate(t, "pg.test")
-			settings := postgresSettings{tls: serverTLS}
-			if mode == "authentication" {
-				settings.authError = "28P01"
-			}
-			if mode == "client_certificate" {
-				serverTLS.ClientAuth = tls.RequireAnyClientCert
-			}
-			server := newPostgres(t, "healthy", false, settings)
-			target := server.target(1)
-			target.Endpoint.ServerName = "pg.test"
-			roots := x509.NewCertPool()
-			roots.AppendCertsFromPEM(ca)
-			cfg := testConfig(t)
-			cfg.MaxConns = 1
-			cfg.ConnConfig.TLSConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
-			var attempts, hooks atomic.Int32
-			dial := cfg.ConnConfig.DialFunc
-			cfg.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
-				attempts.Add(1)
-				return dial(ctx, network, address)
-			}
-			fail := func() error { hooks.Add(1); return io.EOF }
-			switch mode {
-			case "wrong_server_name":
-				target.Endpoint.ServerName = "wrong.test"
-			case "verify_peer":
-				cfg.ConnConfig.TLSConfig.VerifyPeerCertificate = func([][]byte, [][]*x509.Certificate) error { return fail() }
-			case "verify_connection":
-				cfg.ConnConfig.TLSConfig.VerifyConnection = func(tls.ConnectionState) error { return fail() }
-			case "client_certificate":
-				cfg.ConnConfig.TLSConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return nil, fail() }
-			}
-			pool, err := Open(context.Background(), Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second})
-			if pool != nil || err == nil || attempts.Load() != 1 {
-				t.Fatalf("permanent startup failure was retried: pool=%v attempts=%d error=%v", pool, attempts.Load(), err)
-			}
-			if mode == "verify_peer" || mode == "verify_connection" || mode == "client_certificate" {
-				if hooks.Load() != 1 || !errors.Is(err, io.EOF) {
-					t.Fatalf("TLS callback retried or lost error identity: calls=%d error=%v", hooks.Load(), err)
-				}
+	for _, path := range []string{"single_address", "missing_internal_dns"} {
+		t.Run(path, func(t *testing.T) {
+			for _, mode := range []string{"authentication", "wrong_server_name", "verify_peer", "verify_connection", "client_certificate"} {
+				t.Run(mode, func(t *testing.T) {
+					serverTLS, ca := testCertificate(t, "pg.test")
+					settings := postgresSettings{tls: serverTLS}
+					if mode == "authentication" {
+						settings.authError = "28P01"
+					}
+					if mode == "client_certificate" {
+						serverTLS.ClientAuth = tls.RequireAnyClientCert
+					}
+					server := newPostgres(t, "healthy", false, settings)
+					target := server.target(1)
+					target.Endpoint.ServerName = "pg.test"
+					roots := x509.NewCertPool()
+					roots.AppendCertsFromPEM(ca)
+					cfg := testConfig(t)
+					cfg.MaxConns = 1
+					cfg.ConnConfig.TLSConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+					var attempts, hooks atomic.Int32
+					dial := cfg.ConnConfig.DialFunc
+					cfg.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+						attempts.Add(1)
+						return dial(ctx, network, address)
+					}
+					fail := func() error { hooks.Add(1); return io.EOF }
+					switch mode {
+					case "wrong_server_name":
+						target.Endpoint.ServerName = "wrong.test"
+					case "verify_peer":
+						cfg.ConnConfig.TLSConfig.VerifyPeerCertificate = func([][]byte, [][]*x509.Certificate) error { return fail() }
+					case "verify_connection":
+						cfg.ConnConfig.TLSConfig.VerifyConnection = func(tls.ConnectionState) error { return fail() }
+					case "client_certificate":
+						cfg.ConnConfig.TLSConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return nil, fail() }
+					}
+					if path == "missing_internal_dns" {
+						target = missingInternalEndpoint(cfg.ConnConfig, target)
+					}
+					pool, err := Open(context.Background(), Config{Resolver: newResolver(target), ConnConfig: cfg, StartupTimeout: time.Second})
+					if pool != nil || err == nil || attempts.Load() != 1 {
+						t.Fatalf("permanent startup failure was retried: pool=%v attempts=%d error=%v", pool, attempts.Load(), err)
+					}
+					if mode == "verify_peer" || mode == "verify_connection" || mode == "client_certificate" {
+						if hooks.Load() != 1 || !errors.Is(err, io.EOF) {
+							t.Fatalf("TLS callback retried or lost error identity: calls=%d error=%v", hooks.Load(), err)
+						}
+					}
+				})
 			}
 		})
 	}

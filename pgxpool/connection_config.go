@@ -58,6 +58,8 @@ func (p *Pool) configureConnection(ctx context.Context, cc *pgx.ConnConfig) erro
 		addresses, err := lookup(ctx, host)
 		if err == nil {
 			paths.resolved(host, addresses)
+		} else if connectionTarget.FallbackEndpoint.Host != "" && connectionTarget.FallbackEndpoint.Host != connectionTarget.Endpoint.Host {
+			err = &optionalLookupError{err}
 		}
 		return addresses, err
 	}

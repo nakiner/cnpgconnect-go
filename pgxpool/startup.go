@@ -19,6 +19,12 @@ type startupHookError struct{ error }
 
 func (e *startupHookError) Unwrap() error { return e.error }
 
+// A lookup failure can belong to an optional address of the selected member.
+// Preserve this context when pgx joins it with another address's connect error.
+type optionalLookupError struct{ error }
+
+func (e *optionalLookupError) Unwrap() error { return e.error }
+
 func hookError(err error) error {
 	if err != nil {
 		return &startupHookError{err}
@@ -57,29 +63,51 @@ func (p *Pool) pingStartup(ctx context.Context) error {
 }
 
 func transientConnectError(err error) bool {
+	retryable, permanent := classifyConnectError(err, false)
+	return retryable && !permanent
+}
+
+// An optional missing hostname is neutral: it cannot veto another address's
+// transient failure, but it cannot trigger retries by itself either. Every
+// authentication, TLS verification, or application-hook error still vetoes.
+func classifyConnectError(err error, optionalLookup bool) (retryable, permanent bool) {
 	switch err := err.(type) {
+	case *optionalLookupError:
+		return classifyConnectError(err.error, true)
 	case *startupHookError, *tls.CertificateVerificationError:
-		return false
+		return false, true
+	case *net.DNSError:
+		if cause := err.Unwrap(); cause != nil {
+			return classifyConnectError(cause, optionalLookup)
+		}
+		if optionalLookup && err.IsNotFound {
+			return false, false
+		}
 	case *pgconn.PgError:
-		return err.Code == "57P03" // PostgreSQL cannot accept connections yet.
+		retryable = err.Code == "57P03" // PostgreSQL cannot accept connections yet.
+		return retryable, !retryable
 	case interface{ Unwrap() []error }:
 		causes := err.Unwrap()
-		for _, cause := range causes {
-			if !transientConnectError(cause) {
-				return false
-			}
+		if len(causes) == 0 {
+			return false, true
 		}
-		return len(causes) != 0
+		for _, cause := range causes {
+			canRetry, mustStop := classifyConnectError(cause, optionalLookup)
+			retryable = retryable || canRetry
+			permanent = permanent || mustStop
+		}
+		return retryable, permanent
 	case interface{ Unwrap() error }:
 		if cause := err.Unwrap(); cause != nil {
-			return transientConnectError(cause)
+			return classifyConnectError(cause, optionalLookup)
 		}
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE) {
-		return true
+		return true, false
 	}
 	var networkError net.Error
-	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
+	retryable = errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
+	return retryable, !retryable
 }
