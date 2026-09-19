@@ -76,7 +76,7 @@ libraries accepting `*sql.DB` work the same way.
 | `cnpgconnect-go/stdlib` | `*sql.DB` |
 | `cnpgconnect-go` | Discovery `Client` and reusable `Resolver` interface |
 
-The Go package name is `cnpgconnectgo`. Go 1.27.1 or later is required.
+The Go package name is `cnpgconnectgo`. Go 1.26 or later is required.
 See the [runnable examples](examples/README.md).
 
 ## Routing and pool options

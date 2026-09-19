@@ -1,7 +1,7 @@
 # Unreleased hardening contract
 
 These changes are in the source checkout; they are not a claim that existing
-published client/plugin versions include them. Go 1.27.1 and patched gRPC
+published client/plugin versions include them. Go 1.26 and patched gRPC
 v1.83.2 are used by this revision. Use the matching plugin/client changes.
 
 ## Freshness and withdrawal

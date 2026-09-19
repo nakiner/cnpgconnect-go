@@ -42,7 +42,7 @@ bounded route history. Configuration and public signatures are unchanged.
 
 The matching plugin/client pair then passed eight isolated suites with no
 failures or skips against Kubernetes 1.34.0, CNPG 1.30.0 and PostgreSQL 18.4,
-using Go 1.27.1. Three lifecycle repetitions retained the same pgx, database/sql
+using Go 1.26.0. Three lifecycle repetitions retained the same pgx, database/sql
 and prepared-statement handles through planned promotion and primary Pod loss.
 Discovery outage and open-socket stall recovery passed. The plugin's CA Secret
 update and certificate renewal checks passed, and the disposable cluster was
