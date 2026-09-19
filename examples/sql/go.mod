@@ -1,6 +1,6 @@
 module github.com/nakiner/cnpgconnect-go/examples/sql
 
-go 1.26.0
+go 1.26.8
 
 replace github.com/nakiner/cnpgconnect-go => ../..
 
@@ -11,7 +11,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.11.0 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/nakiner/cnpg-connect-plugin v0.0.8 // indirect
+	github.com/nakiner/cnpg-connect-plugin v0.0.9 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
